@@ -150,30 +150,6 @@ impl<F: 'static + FileLoad + FileStore> DictionaryFiles<F> {
 }
 
 #[derive(Clone)]
-pub struct IdMapMaps {
-    pub node_value_idmap_maps: Option<BitIndexMaps>,
-    pub predicate_idmap_maps: Option<BitIndexMaps>,
-}
-
-#[derive(Clone)]
-pub struct IdMapFiles<F: 'static + FileLoad + FileStore> {
-    pub node_value_idmap_files: BitIndexFiles<F>,
-    pub predicate_idmap_files: BitIndexFiles<F>,
-}
-
-impl<F: 'static + FileLoad + FileStore> IdMapFiles<F> {
-    pub async fn map_all(&self) -> io::Result<IdMapMaps> {
-        let node_value_idmap_maps = self.node_value_idmap_files.map_all_if_exists().await?;
-        let predicate_idmap_maps = self.predicate_idmap_files.map_all_if_exists().await?;
-
-        Ok(IdMapMaps {
-            node_value_idmap_maps,
-            predicate_idmap_maps,
-        })
-    }
-}
-
-#[derive(Clone)]
 pub struct BitIndexMaps {
     pub bits_map: Bytes,
     pub blocks_map: Bytes,
@@ -309,22 +285,6 @@ impl<F1: 'static + FileLoad + FileStore> AdjacencyListFiles<F1> {
     ) -> io::Result<()> {
         copy_file(&from.nums_file, &self.nums_file).await?;
         self.bitindex_files.copy_from(&from.bitindex_files).await?;
-
-        Ok(())
-    }
-}
-
-impl<F1: 'static + FileLoad + FileStore> IdMapFiles<F1> {
-    pub async fn copy_from<F2: 'static + FileLoad + FileStore>(
-        &self,
-        from: &IdMapFiles<F2>,
-    ) -> io::Result<()> {
-        self.node_value_idmap_files
-            .copy_from(&from.node_value_idmap_files)
-            .await?;
-        self.predicate_idmap_files
-            .copy_from(&from.predicate_idmap_files)
-            .await?;
 
         Ok(())
     }

@@ -401,7 +401,7 @@ impl<B: Buf> Iterator for BitArrayBlockIterator<B> {
 }
 
 /// Read the length (number of bits) from a `FileLoad`.
-pub(crate) async fn bitarray_len_from_file<F: FileLoad>(f: F) -> io::Result<u64> {
+pub async fn bitarray_len_from_file<F: FileLoad>(f: F) -> io::Result<u64> {
     BitArrayError::validate_input_buf_size(f.size().await?)?;
     let mut control_word = vec![0; 8];
     f.open_read_from(f.size().await? - 8)

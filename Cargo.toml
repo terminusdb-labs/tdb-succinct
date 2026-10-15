@@ -1,7 +1,8 @@
 [package]
 name = "tdb-succinct"
-version = "0.1.2"
+version = "0.1.4"
 authors = [
+    "Philippe Höij <philippe@hoij.net>",
     "Matthijs van Otterdijk <matthijs@terminusdb.com>",
     "Gavin Mendel-Gleason <gavin@terminusdb.com>"
 ]

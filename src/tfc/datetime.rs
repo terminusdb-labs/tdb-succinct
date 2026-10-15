@@ -1,5 +1,5 @@
 use bytes::Buf;
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDateTime};
 use rug::Integer;
 
 use super::{
@@ -8,9 +8,9 @@ use super::{
 };
 
 pub fn datetime_to_parts(datetime: &NaiveDateTime) -> (bool, Integer, u32) {
-    let mut seconds = Integer::from(datetime.timestamp());
+    let mut seconds = Integer::from(datetime.and_utc().timestamp());
     let is_neg = seconds < 0;
-    let mut nanos = datetime.timestamp_subsec_nanos();
+    let mut nanos = datetime.and_utc().timestamp_subsec_nanos();
     if is_neg && nanos != 0 {
         seconds += 1;
         nanos = 1_000_000_000 - nanos;
@@ -39,7 +39,9 @@ pub fn storage_to_datetime<B: Buf>(bytes: &mut B) -> NaiveDateTime {
         .to_i64()
         .expect("This is a surprisingly large number of seconds!");
     if fraction.is_empty() {
-        NaiveDateTime::from_timestamp_opt(seconds, 0).unwrap()
+        DateTime::from_timestamp(seconds, 0)
+            .expect("Seconds out of range")
+            .naive_utc()
     } else {
         let zeros = "0".repeat(9 - fraction.len());
         let fraction = format!("{fraction}{zeros}");
@@ -47,9 +49,13 @@ pub fn storage_to_datetime<B: Buf>(bytes: &mut B) -> NaiveDateTime {
             .parse::<u32>()
             .expect("Nano seconds should actually fit in u32");
         if is_pos {
-            NaiveDateTime::from_timestamp_opt(seconds, nanos).unwrap()
+            DateTime::from_timestamp(seconds, nanos)
+                .expect("Seconds out of range")
+                .naive_utc()
         } else {
-            NaiveDateTime::from_timestamp_opt(seconds - 1, 1_000_000_000 - nanos).unwrap()
+            DateTime::from_timestamp(seconds - 1, 1_000_000_000 - nanos)
+                .expect("Seconds out of range")
+                .naive_utc()
         }
     }
 }
@@ -62,7 +68,9 @@ mod tests {
 
     #[test]
     fn a_few_nanos_before_epoch() {
-        let dt = NaiveDateTime::from_timestamp_opt(-1, 234).unwrap();
+        let dt = DateTime::from_timestamp(-1, 234)
+            .expect("Seconds out of range")
+            .naive_utc();
         let result = datetime_to_parts(&dt);
         assert_eq!((true, Integer::from(0), 999999766_u32), result)
     }

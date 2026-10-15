@@ -370,7 +370,7 @@ mod tests {
             u32::make_entry(&69),
             u32::make_entry(&75),
             u32::make_entry(&85),
-            f64::make_entry(&3.1415),
+            f64::make_entry(&std::f64::consts::PI),
         ];
 
         typed_dict_test(input).await;

@@ -7,7 +7,7 @@ use super::{
 use base64::display::Base64Display;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use chrono::{NaiveDateTime, NaiveTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use num_derive::FromPrimitive;
 use rug::Integer;
 
@@ -59,6 +59,7 @@ pub enum Datatype {
     Base64Binary,
     HexBinary,
     AnySimpleType,
+    DateTimeInterval,
 }
 
 impl Datatype {
@@ -84,6 +85,7 @@ impl Datatype {
             Datatype::BigInt => None,
             Datatype::Token => None,
             Datatype::LangString => None,
+            Datatype::DateTimeInterval => None,
             _ => None,
         }
     }
@@ -828,6 +830,7 @@ impl FromLexical<GMonthDay> for String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct Duration {
     pub sign: i8,
     pub year: i64,
@@ -1040,6 +1043,128 @@ impl TdbDataType for HexBinary {
     }
 }
 
+/// Component type tag for DateTimeInterval endpoints.
+/// 0 = xsd:date, 1 = xsd:dateTime
+pub const INTERVAL_COMPONENT_DATE: u8 = 0;
+pub const INTERVAL_COMPONENT_DATETIME: u8 = 1;
+
+/// Flag values for DateTimeInterval original input form.
+/// 0 = explicit (user gave start/end), 1 = start+duration, 2 = duration+end
+pub const INTERVAL_FLAG_EXPLICIT: u8 = 0;
+pub const INTERVAL_FLAG_START_DURATION: u8 = 1;
+pub const INTERVAL_FLAG_DURATION_END: u8 = 2;
+
+/// A date-time interval with materialized start/end, preserved duration, and
+/// a flag recording the original input form.
+///
+/// Binary encoding (48 bytes fixed-width):
+/// - Sorting prefix (24 bytes): start_seconds(i64) + start_nanos(u32) + end_seconds(i64) + end_nanos(u32)
+/// - Metadata suffix (24 bytes): start_type(u8) + end_type(u8) + flag(u8) + duration(21 bytes)
+#[derive(Debug, Clone, PartialEq)]
+pub struct DateTimeInterval {
+    pub start_seconds: i64,
+    pub start_nanos: u32,
+    pub end_seconds: i64,
+    pub end_nanos: u32,
+    pub start_type: u8,
+    pub end_type: u8,
+    pub flag: u8,
+    pub duration: Duration,
+}
+
+impl TdbDataType for DateTimeInterval {
+    fn datatype() -> Datatype {
+        Datatype::DateTimeInterval
+    }
+}
+
+impl ToLexical<DateTimeInterval> for DateTimeInterval {
+    fn to_lexical(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(48);
+        // Sorting prefix: start timestamp (12 bytes) + end timestamp (12 bytes)
+        buf.extend_from_slice(&self.start_seconds.to_lexical());
+        buf.put_u32(self.start_nanos);
+        buf.extend_from_slice(&self.end_seconds.to_lexical());
+        buf.put_u32(self.end_nanos);
+        // Metadata suffix: types + flag + duration
+        buf.put_u8(self.start_type);
+        buf.put_u8(self.end_type);
+        buf.put_u8(self.flag);
+        buf.extend_from_slice(&self.duration.to_lexical());
+        buf.freeze()
+    }
+}
+
+impl FromLexical<DateTimeInterval> for DateTimeInterval {
+    fn from_lexical<B: Buf>(mut b: B) -> Self {
+        let start_seconds = i64::from_lexical(&mut b);
+        let start_nanos = b.get_u32();
+        let end_seconds = i64::from_lexical(&mut b);
+        let end_nanos = b.get_u32();
+        let start_type = b.get_u8();
+        let end_type = b.get_u8();
+        let flag = b.get_u8();
+        let duration = Duration::from_lexical(&mut b);
+        DateTimeInterval {
+            start_seconds,
+            start_nanos,
+            end_seconds,
+            end_nanos,
+            start_type,
+            end_type,
+            flag,
+            duration,
+        }
+    }
+}
+
+fn interval_component_to_iso(seconds: i64, nanos: u32) -> String {
+    let ndt = DateTime::from_timestamp(seconds, nanos)
+        .map(|dt| dt.naive_utc())
+        .unwrap_or_else(|| {
+            NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        });
+    if nanos == 0 {
+        ndt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    } else {
+        ndt.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string()
+    }
+}
+
+fn interval_duration_to_iso(duration: &Duration) -> String {
+    let s = duration_string(duration);
+    if duration.sign < 0 {
+        format!("-{s}")
+    } else {
+        s
+    }
+}
+
+impl FromLexical<DateTimeInterval> for String {
+    fn from_lexical<B: Buf>(b: B) -> String {
+        let iv = DateTimeInterval::from_lexical(b);
+        let dur_str = interval_duration_to_iso(&iv.duration);
+        match iv.flag {
+            INTERVAL_FLAG_START_DURATION => {
+                let start = interval_component_to_iso(iv.start_seconds, iv.start_nanos);
+                format!("{start}/{dur_str}")
+            }
+            INTERVAL_FLAG_DURATION_END => {
+                let end = interval_component_to_iso(iv.end_seconds, iv.end_nanos);
+                format!("{dur_str}/{end}")
+            }
+            _ => {
+                let start = interval_component_to_iso(iv.start_seconds, iv.start_nanos);
+                let end = interval_component_to_iso(iv.end_seconds, iv.end_nanos);
+                format!("{start}/{end}")
+            }
+        }
+    }
+}
+
 macro_rules! stringy_type {
     ($ty:ident) => {
         stringy_type!($ty, $ty);
@@ -1144,3 +1269,551 @@ biginty_type!(PositiveInteger);
 biginty_type!(NonNegativeInteger);
 biginty_type!(NegativeInteger);
 biginty_type!(NonPositiveInteger);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tfc::typed::TypedDictEntry;
+
+    fn make_duration(
+        sign: i8,
+        year: i64,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: f64,
+    ) -> Duration {
+        Duration {
+            sign,
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        }
+    }
+
+    fn make_interval(
+        start_seconds: i64,
+        start_nanos: u32,
+        end_seconds: i64,
+        end_nanos: u32,
+        start_type: u8,
+        end_type: u8,
+        flag: u8,
+        duration: Duration,
+    ) -> DateTimeInterval {
+        DateTimeInterval {
+            start_seconds,
+            start_nanos,
+            end_seconds,
+            end_nanos,
+            start_type,
+            end_type,
+            flag,
+            duration,
+        }
+    }
+
+    #[test]
+    fn date_time_interval_round_trip_explicit() {
+        let iv = make_interval(
+            1735689600,
+            0, // 2025-01-01T00:00:00Z
+            1743465600,
+            0, // 2025-04-01T00:00:00Z
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 0, 0, 0.0),
+        );
+        let bytes = iv.to_lexical();
+        let iv2 = DateTimeInterval::from_lexical(bytes);
+        assert_eq!(iv, iv2);
+    }
+
+    #[test]
+    fn date_time_interval_round_trip_start_duration() {
+        let iv = make_interval(
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_START_DURATION,
+            make_duration(1, 0, 3, 0, 0, 0, 0.0), // P3M
+        );
+        let bytes = iv.to_lexical();
+        let iv2 = DateTimeInterval::from_lexical(bytes);
+        assert_eq!(iv, iv2);
+    }
+
+    #[test]
+    fn date_time_interval_round_trip_duration_end() {
+        let iv = make_interval(
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_DURATION_END,
+            make_duration(1, 0, 3, 0, 0, 0, 0.0),
+        );
+        let bytes = iv.to_lexical();
+        let iv2 = DateTimeInterval::from_lexical(bytes);
+        assert_eq!(iv, iv2);
+    }
+
+    #[test]
+    fn date_time_interval_round_trip_with_nanos() {
+        let iv = make_interval(
+            1735689600,
+            500_000_000,
+            1743465600,
+            999_999_999,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 0, 0, 0.5),
+        );
+        let bytes = iv.to_lexical();
+        let iv2 = DateTimeInterval::from_lexical(bytes);
+        assert_eq!(iv, iv2);
+    }
+
+    #[test]
+    fn date_time_interval_round_trip_negative_timestamps() {
+        // Before Unix epoch: 1969-06-15T00:00:00Z
+        let iv = make_interval(
+            -16070400,
+            0,
+            -8035200,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 93, 0, 0, 0.0),
+        );
+        let bytes = iv.to_lexical();
+        let iv2 = DateTimeInterval::from_lexical(bytes);
+        assert_eq!(iv, iv2);
+    }
+
+    #[test]
+    fn date_time_interval_preserves_duration_granularity() {
+        // P3M and P90D are different durations even if they cover similar spans
+        let iv_3m = make_interval(
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_START_DURATION,
+            make_duration(1, 0, 3, 0, 0, 0, 0.0), // P3M
+        );
+        let iv_90d = make_interval(
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_START_DURATION,
+            make_duration(1, 0, 0, 90, 0, 0, 0.0), // P90D
+        );
+
+        let bytes_3m = iv_3m.to_lexical();
+        let bytes_90d = iv_90d.to_lexical();
+
+        // Same start/end timestamps but different duration metadata
+        let rt_3m = DateTimeInterval::from_lexical(bytes_3m);
+        let rt_90d = DateTimeInterval::from_lexical(bytes_90d);
+
+        assert_eq!(rt_3m.duration.month, 3);
+        assert_eq!(rt_3m.duration.day, 0);
+        assert_eq!(rt_90d.duration.month, 0);
+        assert_eq!(rt_90d.duration.day, 90);
+        assert_ne!(rt_3m, rt_90d);
+    }
+
+    #[test]
+    fn date_time_interval_sorting_by_start_then_end() {
+        // Earlier start sorts first
+        let iv_early = make_interval(
+            1000000,
+            0,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 11, 0, 0, 0.0),
+        );
+        let iv_late = make_interval(
+            1500000,
+            0,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 5, 0, 0, 0.0),
+        );
+
+        let entry_early = DateTimeInterval::make_entry(&iv_early);
+        let entry_late = DateTimeInterval::make_entry(&iv_late);
+        assert!(entry_early < entry_late);
+
+        // Same start, earlier end sorts first
+        let iv_short = make_interval(
+            1000000,
+            0,
+            1500000,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 5, 0, 0, 0.0),
+        );
+        let iv_long = make_interval(
+            1000000,
+            0,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 11, 0, 0, 0.0),
+        );
+
+        let entry_short = DateTimeInterval::make_entry(&iv_short);
+        let entry_long = DateTimeInterval::make_entry(&iv_long);
+        assert!(entry_short < entry_long);
+    }
+
+    #[test]
+    fn date_time_interval_sorting_nanos_tiebreaker() {
+        let iv_a = make_interval(
+            1000000,
+            100,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 11, 0, 0, 0.0),
+        );
+        let iv_b = make_interval(
+            1000000,
+            200,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 11, 0, 0, 0.0),
+        );
+
+        let entry_a = DateTimeInterval::make_entry(&iv_a);
+        let entry_b = DateTimeInterval::make_entry(&iv_b);
+        assert!(entry_a < entry_b);
+    }
+
+    #[test]
+    fn date_time_interval_sorting_negative_before_positive() {
+        let iv_neg = make_interval(
+            -1000000,
+            0,
+            0,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 11, 0, 0, 0.0),
+        );
+        let iv_pos = make_interval(
+            1000000,
+            0,
+            2000000,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 11, 0, 0, 0.0),
+        );
+
+        let entry_neg = DateTimeInterval::make_entry(&iv_neg);
+        let entry_pos = DateTimeInterval::make_entry(&iv_pos);
+        assert!(entry_neg < entry_pos);
+    }
+
+    #[test]
+    fn date_time_interval_flag_values_preserved() {
+        for flag in [
+            INTERVAL_FLAG_EXPLICIT,
+            INTERVAL_FLAG_START_DURATION,
+            INTERVAL_FLAG_DURATION_END,
+        ] {
+            let iv = make_interval(
+                1735689600,
+                0,
+                1743465600,
+                0,
+                INTERVAL_COMPONENT_DATE,
+                INTERVAL_COMPONENT_DATE,
+                flag,
+                make_duration(1, 0, 3, 0, 0, 0, 0.0),
+            );
+            let rt = DateTimeInterval::from_lexical(iv.to_lexical());
+            assert_eq!(flag, rt.flag, "flag {flag} not preserved in round-trip");
+        }
+    }
+
+    #[test]
+    fn date_time_interval_component_types_preserved() {
+        let iv = make_interval(
+            1735689600,
+            0,
+            1743465600,
+            500_000,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 0, 0, 0.0),
+        );
+        let rt = DateTimeInterval::from_lexical(iv.to_lexical());
+        assert_eq!(INTERVAL_COMPONENT_DATE, rt.start_type);
+        assert_eq!(INTERVAL_COMPONENT_DATETIME, rt.end_type);
+    }
+
+    #[test]
+    fn date_time_interval_mixed_in_typed_dict_sort() {
+        let mut entries: Vec<TypedDictEntry> = vec![
+            DateTimeInterval::make_entry(&make_interval(
+                2000000,
+                0,
+                3000000,
+                0,
+                INTERVAL_COMPONENT_DATE,
+                INTERVAL_COMPONENT_DATE,
+                INTERVAL_FLAG_EXPLICIT,
+                make_duration(1, 0, 0, 11, 0, 0, 0.0),
+            )),
+            DateTimeInterval::make_entry(&make_interval(
+                1000000,
+                0,
+                3000000,
+                0,
+                INTERVAL_COMPONENT_DATE,
+                INTERVAL_COMPONENT_DATE,
+                INTERVAL_FLAG_EXPLICIT,
+                make_duration(1, 0, 0, 23, 0, 0, 0.0),
+            )),
+            DateTimeInterval::make_entry(&make_interval(
+                1000000,
+                0,
+                2000000,
+                0,
+                INTERVAL_COMPONENT_DATE,
+                INTERVAL_COMPONENT_DATE,
+                INTERVAL_FLAG_START_DURATION,
+                make_duration(1, 0, 0, 11, 0, 0, 0.0),
+            )),
+        ];
+        entries.sort();
+
+        // Expected order: (1M,2M) < (1M,3M) < (2M,3M)
+        let iv0 = entries[0].as_val::<DateTimeInterval, DateTimeInterval>();
+        let iv1 = entries[1].as_val::<DateTimeInterval, DateTimeInterval>();
+        let iv2 = entries[2].as_val::<DateTimeInterval, DateTimeInterval>();
+
+        assert_eq!(1000000, iv0.start_seconds);
+        assert_eq!(2000000, iv0.end_seconds);
+        assert_eq!(1000000, iv1.start_seconds);
+        assert_eq!(3000000, iv1.end_seconds);
+        assert_eq!(2000000, iv2.start_seconds);
+        assert_eq!(3000000, iv2.end_seconds);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_explicit_dates() {
+        let iv = make_interval(
+            1735689600,
+            0, // 2025-01-01T00:00:00Z
+            1743465600,
+            0, // 2025-04-01T00:00:00Z
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 0, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_explicit_datetimes_with_time() {
+        // 2025-01-01T10:30:00Z and 2025-04-01T15:45:00Z
+        let iv = make_interval(
+            1735727400,
+            0, // 2025-01-01T10:30:00Z
+            1743522300,
+            0, // 2025-04-01T15:45:00Z
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 5, 15, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T10:30:00Z/2025-04-01T15:45:00Z", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_explicit_with_nanos() {
+        let iv = make_interval(
+            1735689600,
+            500_000_000,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 0, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T00:00:00.500Z/2025-04-01T00:00:00Z", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_start_duration() {
+        let iv = make_interval(
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_START_DURATION,
+            make_duration(1, 0, 3, 0, 0, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T00:00:00Z/P3M", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_duration_end() {
+        let iv = make_interval(
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_DURATION_END,
+            make_duration(1, 0, 3, 0, 0, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("P3M/2025-04-01T00:00:00Z", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_duration_with_time_parts() {
+        let iv = make_interval(
+            1735689600,
+            0,
+            1735693200,
+            0, // 1 hour later
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_START_DURATION,
+            make_duration(1, 0, 0, 0, 1, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T00:00:00Z/PT1H", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_midnight_datetime_renders_time() {
+        let iv = make_interval(
+            1735689600,
+            0, // 2025-01-01T00:00:00Z (midnight)
+            1743465600,
+            0, // 2025-04-01T00:00:00Z (midnight)
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 0, 0, 0.0),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z", s);
+    }
+
+    #[test]
+    fn duration_to_string_tenth_second() {
+        let duration = Duration {
+            sign: 1,
+            year: 0,
+            month: 0,
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0.1,
+        };
+        let s = duration_string(&duration);
+        assert_eq!("PT0.1S", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_with_tenth_second_period() {
+        let iv = make_interval(
+            1735689600,
+            0,
+            1735689600,
+            100_000_000,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 0, 0, 0, 0.1),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T00:00:00Z/2025-01-01T00:00:00.100Z", s);
+    }
+
+    #[test]
+    fn date_time_interval_iso_string_start_duration_tenth_second() {
+        let iv = make_interval(
+            1735689600,
+            0,
+            1735689600,
+            100_000_000,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_START_DURATION,
+            make_duration(1, 0, 0, 0, 0, 0, 0.1),
+        );
+        let s = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!("2025-01-01T00:00:00Z/PT0.1S", s);
+    }
+
+    #[test]
+    fn date_time_interval_encoding_is_48_bytes() {
+        let iv = make_interval(
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_COMPONENT_DATE,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 3, 0, 0, 0, 0.0),
+        );
+        let bytes = iv.to_lexical();
+        // 8(i64) + 4(u32) + 8(i64) + 4(u32) + 1 + 1 + 1 + duration(1+8+1+1+1+1+8 = 21) = 48
+        assert_eq!(48, bytes.len());
+    }
+}

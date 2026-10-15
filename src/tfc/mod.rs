@@ -5,6 +5,7 @@ pub mod decimal;
 pub mod dict;
 pub mod file;
 pub mod integer;
+pub mod interval;
 pub mod stream;
 pub mod typed;
 

@@ -301,7 +301,7 @@ mod tests {
     fn encode_decode_success(buf: &mut [u8], expected: &[u8], num: u64) {
         assert_eq!(Some(expected.len()), encode_slice(buf, num));
         assert_eq!(expected, buf);
-        let (n, len) = decode(&buf).unwrap();
+        let (n, len) = decode(buf).unwrap();
         assert_eq!(num, n);
         assert_eq!(expected.len(), len);
     }
@@ -351,9 +351,9 @@ mod tests {
         let mut expected = [0x7f; 10];
         assert_eq!(Err(DecodeError::UnexpectedEncodingLen), decode(&buf));
         expected[9] = set_msb(0x01);
-        encode_decode_success(&mut buf, &expected, u64::max_value());
+        encode_decode_success(&mut buf, &expected, u64::MAX);
         expected[0] -= 1;
-        encode_decode_success(&mut buf, &expected, u64::max_value() - 1);
+        encode_decode_success(&mut buf, &expected, u64::MAX - 1);
     }
 
     #[test]
@@ -411,8 +411,8 @@ mod tests {
             (1, 1),
             (2, 0b11_0101000),
             (7, 0b1100001_1000110_1001000_1001010_1010101_0010010_0100000),
-            (10, u64::max_value() - 1),
-            (MAX_ENCODING_LEN, u64::max_value()),
+            (10, u64::MAX - 1),
+            (MAX_ENCODING_LEN, u64::MAX),
         ] {
             assert_eq!(len, encoding_len(num));
         }

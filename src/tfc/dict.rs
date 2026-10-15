@@ -354,7 +354,7 @@ mod tests {
         build_dict_and_offsets(
             &mut array_buf,
             &mut data_buf,
-            strings.clone().into_iter().map(|s| Bytes::from(s)),
+            strings.clone().into_iter().map(Bytes::from),
         );
 
         let array_bytes = array_buf.freeze();
@@ -401,7 +401,7 @@ mod tests {
         let logarray_builder = LateLogArrayBufBuilder::new(&mut array_buf);
 
         let mut builder = SizedDictBufBuilder::new(None, 0, 0, logarray_builder, data_buf);
-        builder.add_all(strings.clone().into_iter().map(|v| Bytes::from_static(v)));
+        builder.add_all(strings.clone().into_iter().map(Bytes::from_static));
         let (mut logarray_builder, data_buf, _, _) = builder.finalize();
         logarray_builder.pop();
         logarray_builder.finalize();

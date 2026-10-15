@@ -57,7 +57,7 @@ mod tests {
 
     #[test]
     pub fn max() {
-        for b in BitIter::new(u64::max_value()) {
+        for b in BitIter::new(u64::MAX) {
             assert!(b);
         }
     }

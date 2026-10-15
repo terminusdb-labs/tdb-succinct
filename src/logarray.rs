@@ -1002,7 +1002,7 @@ mod tests {
         assert_eq!(err(7), val(7));
         assert_eq!(Ok(()), val(8));
         assert_eq!(Ok(()), val(9));
-        assert_eq!(Ok(()), val(usize::max_value()));
+        assert_eq!(Ok(()), val(usize::MAX));
     }
 
     #[test]
@@ -1038,8 +1038,8 @@ mod tests {
         assert_eq!(
             Ok(()),
             val(
-                usize::try_from(u64::from(u32::max_value()) + 1 << 3).unwrap(),
-                u32::max_value() as u64,
+                usize::try_from(u64::from(u32::MAX) + 1 << 3).unwrap(),
+                u32::MAX as u64,
                 64
             )
         );
@@ -1146,7 +1146,7 @@ mod tests {
     #[should_panic(expected = "expected slice offset (4294967296)")]
     #[cfg(target_pointer_width = "64")]
     fn slice_panic2() {
-        let _ = test0_logarray().slice(usize::try_from(u32::max_value()).unwrap() + 1, 2);
+        let _ = test0_logarray().slice(usize::try_from(u32::MAX).unwrap() + 1, 2);
     }
 
     #[test]

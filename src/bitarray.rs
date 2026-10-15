@@ -90,7 +90,7 @@ impl BitArrayError {
         // Calculate the expected input buffer size. This includes the control word.
         let expected_buf_size = {
             // The following steps are necessary to avoid overflow. If we add first and shift
-            // second, the addition might result in a value greater than `u64::max_value()`.
+            // second, the addition might result in a value greater than `u64::MAX`.
             // Therefore, we right-shift first to produce a value that cannot overflow, check how
             // much we need to add, and add it.
             let after_shifting = len >> 6 << 3;
@@ -487,8 +487,8 @@ mod tests {
         assert_eq!(
             Ok(()),
             val(
-                usize::try_from(u128::from(u64::max_value()) + 65 >> 6 << 3).unwrap(),
-                u64::max_value()
+                usize::try_from(u128::from(u64::MAX) + 65 >> 6 << 3).unwrap(),
+                u64::MAX
             )
         );
     }

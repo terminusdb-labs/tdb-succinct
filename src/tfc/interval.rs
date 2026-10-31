@@ -7,12 +7,14 @@ use thiserror::Error;
 use std::io;
 
 use super::block::IdLookupResult;
+use super::block::SizedDictEntry;
 use super::datatypes::{
     Datatype, DateTimeInterval, Duration, FromLexical, ToLexical, INTERVAL_COMPONENT_DATE,
     INTERVAL_COMPONENT_DATETIME, INTERVAL_ENCODED_WIDTH, INTERVAL_FLAG_DURATION_END,
-    INTERVAL_FLAG_EXPLICIT, INTERVAL_FLAG_START_DURATION, INTERVAL_NO_ZONE,
+    INTERVAL_FLAG_EXPLICIT, INTERVAL_FLAG_START_DURATION, INTERVAL_LEGACY_ENCODED_WIDTH,
+    INTERVAL_NO_ZONE,
 };
-use super::typed::TypedDict;
+use super::typed::{TypedDict, TypedDictBufBuilder, TypedDictEntry};
 use crate::bitindex::BitIndex;
 use crate::logarray::{LogArray, LogArrayFileBuilder};
 use crate::storage::{FileLoad, FileStore};
@@ -568,6 +570,57 @@ impl TypedDict {
     }
 }
 
+impl TypedDict {
+    /// Return a dictionary whose DateTimeInterval segment uses the 52-byte
+    /// encoding. Legacy 48-byte entries are decoded and re-encoded with a
+    /// zero zone offset (they were always rendered `Z`). Intended to run
+    /// once at layer-open so every downstream reader sees a single width;
+    /// returns a clone unchanged when the segment is already 52-byte.
+    pub fn upgrade_legacy_intervals(&self) -> Self {
+        let Some(seg) = self.interval_segment() else {
+            return self.clone();
+        };
+        let legacy = seg.clone().any(|id| {
+            self.entry(id as usize)
+                .expect("interval id in segment")
+                .to_bytes()
+                .len()
+                != INTERVAL_ENCODED_WIDTH
+        });
+        if !legacy {
+            return self.clone();
+        }
+
+        let mut builder = TypedDictBufBuilder::new(
+            BytesMut::new(),
+            BytesMut::new(),
+            BytesMut::new(),
+            BytesMut::new(),
+        );
+        for entry in self.iter() {
+            let entry = if entry.datatype() == Datatype::DateTimeInterval {
+                let bytes = entry.to_bytes();
+                let upgraded = match bytes.len() {
+                    INTERVAL_LEGACY_ENCODED_WIDTH => {
+                        DateTimeInterval::from_legacy_lexical(bytes).to_lexical()
+                    }
+                    INTERVAL_ENCODED_WIDTH => bytes,
+                    n => panic!(
+                        "invalid DateTimeInterval encoding width: expected {} or {}, got {}",
+                        INTERVAL_ENCODED_WIDTH, INTERVAL_LEGACY_ENCODED_WIDTH, n
+                    ),
+                };
+                TypedDictEntry::new(Datatype::DateTimeInterval, SizedDictEntry::from(upgraded))
+            } else {
+                entry
+            };
+            builder.add(entry);
+        }
+        let (t, o, bo, d) = builder.finalize();
+        TypedDict::from_parts(t.freeze(), o.freeze(), bo.freeze(), d.freeze())
+    }
+}
+
 /// Dense-rank index on interval end timestamps over a TypedDict's
 /// DateTimeInterval segment.
 ///
@@ -925,6 +978,62 @@ mod tests {
             n as usize,
             idx.positions_end_range(0..n, (0, 0), (i64::MAX, u32::MAX))
                 .len()
+        );
+    }
+
+    #[test]
+    fn upgrade_legacy_intervals_converts_48_to_52() {
+        let iv1 = parse_iso_interval("2025-01-01/2025-02-01").unwrap();
+        let iv2 = parse_iso_interval("2025-03-01/2025-04-01").unwrap();
+        // craft legacy entries by truncating the timezone tail
+        let legacy = |iv: &DateTimeInterval| {
+            TypedDictEntry::new(
+                Datatype::DateTimeInterval,
+                SizedDictEntry::from(iv.to_lexical().slice(0..INTERVAL_LEGACY_ENCODED_WIDTH)),
+            )
+        };
+        let dict = build_dict(vec![
+            String::make_entry(&"s".to_string()),
+            legacy(&iv1),
+            legacy(&iv2),
+        ]);
+
+        let up = dict.upgrade_legacy_intervals();
+        let bytes = up.entry(2).unwrap().to_bytes();
+        assert_eq!(INTERVAL_ENCODED_WIDTH, bytes.len());
+        let decoded = <DateTimeInterval as FromLexical<DateTimeInterval>>::from_lexical(bytes);
+        // legacy data always rendered Z -> zero offset
+        assert_eq!(0, decoded.start_tz);
+        assert_eq!(0, decoded.end_tz);
+        let rendered =
+            <String as FromLexical<DateTimeInterval>>::from_lexical(decoded.to_lexical());
+        assert_eq!("2025-01-01T00:00:00Z/2025-02-02T00:00:00Z", rendered);
+        // probes see the upgraded segment
+        assert_eq!(2..4, up.interval_ids_start_le(iv2.start_seconds, 0));
+
+        // mixed-width segment (delta inheriting parent entries): per-entry
+        // dispatch upgrades only the legacy records
+        let iv3 = parse_iso_interval("2025-05-01/2025-06-01").unwrap();
+        let mixed = build_dict(vec![
+            legacy(&iv1),
+            legacy(&iv2),
+            DateTimeInterval::make_entry(&iv3),
+        ]);
+        let up = mixed.upgrade_legacy_intervals();
+        for id in up.interval_segment().unwrap() {
+            assert_eq!(
+                INTERVAL_ENCODED_WIDTH,
+                up.entry(id as usize).unwrap().to_bytes().len()
+            );
+        }
+        assert_eq!(1..3, up.interval_ids_start_le(iv2.start_seconds, 0));
+
+        // a 52-byte dictionary is returned unchanged
+        let fresh = interval_dict();
+        let same = fresh.upgrade_legacy_intervals();
+        assert_eq!(
+            INTERVAL_ENCODED_WIDTH,
+            same.entry(3).unwrap().to_bytes().len()
         );
     }
 

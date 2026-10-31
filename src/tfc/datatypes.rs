@@ -1119,14 +1119,16 @@ impl FromLexical<DateTimeInterval> for DateTimeInterval {
             INTERVAL_ENCODED_WIDTH,
             b.remaining()
         );
-        let start_seconds = i64::from_lexical(&mut b);
-        let start_nanos = b.get_u32();
-        let end_seconds = i64::from_lexical(&mut b);
-        let end_nanos = b.get_u32();
-        let start_type = b.get_u8();
-        let end_type = b.get_u8();
-        let flag = b.get_u8();
-        let duration = Duration::from_lexical(&mut b);
+        let (
+            start_seconds,
+            start_nanos,
+            end_seconds,
+            end_nanos,
+            start_type,
+            end_type,
+            flag,
+            duration,
+        ) = decode_interval_prefix(&mut b);
         let start_tz = b.get_i16();
         let end_tz = b.get_i16();
         DateTimeInterval {
@@ -1140,6 +1142,66 @@ impl FromLexical<DateTimeInterval> for DateTimeInterval {
             duration,
             start_tz,
             end_tz,
+        }
+    }
+}
+
+fn decode_interval_prefix<B: Buf>(b: &mut B) -> (i64, u32, i64, u32, u8, u8, u8, Duration) {
+    let start_seconds = i64::from_lexical(&mut *b);
+    let start_nanos = b.get_u32();
+    let end_seconds = i64::from_lexical(&mut *b);
+    let end_nanos = b.get_u32();
+    let start_type = b.get_u8();
+    let end_type = b.get_u8();
+    let flag = b.get_u8();
+    let duration = Duration::from_lexical(&mut *b);
+    (
+        start_seconds,
+        start_nanos,
+        end_seconds,
+        end_nanos,
+        start_type,
+        end_type,
+        flag,
+        duration,
+    )
+}
+
+/// Width of the pre-timezone interval encoding.
+pub const INTERVAL_LEGACY_ENCODED_WIDTH: usize = 48;
+
+impl DateTimeInterval {
+    /// Decode a legacy 48-byte interval entry (pre-timezone encoding).
+    /// Legacy entries were normalised to UTC and always rendered `Z`, so
+    /// both zone fields are the zero offset.
+    pub fn from_legacy_lexical<B: Buf>(mut b: B) -> Self {
+        assert!(
+            b.remaining() == INTERVAL_LEGACY_ENCODED_WIDTH,
+            "invalid legacy DateTimeInterval encoding width: expected {}, got {}",
+            INTERVAL_LEGACY_ENCODED_WIDTH,
+            b.remaining()
+        );
+        let (
+            start_seconds,
+            start_nanos,
+            end_seconds,
+            end_nanos,
+            start_type,
+            end_type,
+            flag,
+            duration,
+        ) = decode_interval_prefix(&mut b);
+        DateTimeInterval {
+            start_seconds,
+            start_nanos,
+            end_seconds,
+            end_nanos,
+            start_type,
+            end_type,
+            flag,
+            duration,
+            start_tz: 0,
+            end_tz: 0,
         }
     }
 }

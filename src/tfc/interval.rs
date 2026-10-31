@@ -16,9 +16,9 @@ use super::datatypes::{
 };
 use super::typed::{TypedDict, TypedDictBufBuilder, TypedDictEntry};
 use crate::bitindex::BitIndex;
-use crate::logarray::{LogArray, LogArrayFileBuilder};
+use crate::logarray::{LogArray, LogArrayBufBuilder, LogArrayFileBuilder};
 use crate::storage::{FileLoad, FileStore};
-use crate::wavelettree::{build_wavelet_tree_from_iter, WaveletTree};
+use crate::wavelettree::{build_wavelet_tree_from_iter, wavelet_tree_from_iter, WaveletTree};
 
 #[derive(Debug, Error)]
 pub enum IntervalParseError {
@@ -627,6 +627,7 @@ impl TypedDict {
 /// `ends` is a stride-2 LogArray of the sorted distinct `(end_secs,
 /// end_nanos)` keys; `tree` encodes each segment position's end rank.
 /// Positions are 0-based within the interval segment.
+#[derive(Clone)]
 pub struct IntervalEndIndex {
     ends: LogArray,
     tree: WaveletTree,
@@ -638,10 +639,52 @@ fn end_rank_width(n: usize) -> u8 {
     (u64::BITS - n.saturating_sub(1).leading_zeros()).max(1) as u8
 }
 
+/// `(end_secs, end_nanos)` per segment position, in dictionary order.
+fn interval_segment_ends(dict: &TypedDict) -> Vec<(i64, u32)> {
+    dict.interval_segment()
+        .map(|seg| {
+            seg.map(|id| {
+                let entry = dict.entry(id as usize).expect("interval id in segment");
+                let iv = <DateTimeInterval as FromLexical<DateTimeInterval>>::from_lexical(
+                    entry.to_bytes(),
+                );
+                (iv.end_seconds, iv.end_nanos)
+            })
+            .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl IntervalEndIndex {
     pub fn from_parts(ends: LogArray, bits: BitIndex) -> Self {
         let tree = WaveletTree::from_parts(bits, end_rank_width(ends.len() / 2));
         IntervalEndIndex { ends, tree }
+    }
+
+    /// Build the index in memory over a dictionary's DateTimeInterval
+    /// segment (used at layer-open for layers without index files).
+    pub fn build(dict: &TypedDict) -> Self {
+        let ends = interval_segment_ends(dict);
+        let mut distinct = ends.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+
+        let mut ends_builder = LogArrayBufBuilder::new(BytesMut::new(), 64);
+        for &(s, n) in &distinct {
+            ends_builder.push(s as u64);
+            ends_builder.push(n as u64);
+        }
+        let ends_table =
+            LogArray::parse(ends_builder.finalize().freeze()).expect("interval end rank table");
+
+        let ranks = ends
+            .iter()
+            .map(|e| distinct.binary_search(e).unwrap() as u64);
+        let tree = wavelet_tree_from_iter(end_rank_width(distinct.len()), ranks);
+        IntervalEndIndex {
+            ends: ends_table,
+            tree,
+        }
     }
 
     /// Number of interval positions covered.
@@ -904,18 +947,7 @@ mod tests {
 
     /// Decoded (end_secs, end_nanos) per segment position for a dict.
     fn segment_ends(dict: &TypedDict) -> Vec<(i64, u32)> {
-        dict.interval_segment()
-            .map(|seg| {
-                seg.map(|id| {
-                    let e = dict.entry(id as usize).unwrap();
-                    let iv = <DateTimeInterval as FromLexical<DateTimeInterval>>::from_lexical(
-                        e.to_bytes(),
-                    );
-                    (iv.end_seconds, iv.end_nanos)
-                })
-                .collect()
-            })
-            .unwrap_or_default()
+        interval_segment_ends(dict)
     }
 
     #[test]
@@ -944,6 +976,18 @@ mod tests {
         };
         let t_mar1 = t("2025-03-01");
         let t_mar15 = t("2025-03-15");
+
+        // in-memory build agrees with the file-built index
+        let mem_idx = IntervalEndIndex::build(&dict);
+        assert_eq!(idx.len(), mem_idx.len());
+        assert_eq!(
+            idx.positions_end_le(0..n, i64::MAX, u32::MAX),
+            mem_idx.positions_end_le(0..n, i64::MAX, u32::MAX)
+        );
+        assert_eq!(
+            idx.positions_end_range(0..n, t_mar1, t_mar15),
+            mem_idx.positions_end_range(0..n, t_mar1, t_mar15)
+        );
 
         for pos in [0..n, 1..4, 0..0] {
             assert_eq!(

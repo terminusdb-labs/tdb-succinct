@@ -10,6 +10,7 @@ use super::bitarray::*;
 use super::bitindex::*;
 use super::logarray::*;
 use super::util;
+use bytes::BytesMut;
 
 use std::convert::TryInto;
 use std::io;
@@ -384,6 +385,24 @@ pub async fn build_wavelet_tree_from_iter<
     .await?;
 
     Ok(())
+}
+
+/// Build a wavelet tree entirely in memory (no file IO).
+pub fn wavelet_tree_from_iter<I: Iterator<Item = u64>>(width: u8, source: I) -> WaveletTree {
+    let mut fragments = create_fragments(width);
+    for num in source {
+        push_to_fragments(num, width, &mut fragments);
+    }
+    let mut bits_builder = BitArrayBufBuilder::new(BytesMut::new());
+    bits_builder.push_all(fragments.into_iter().flat_map(|f| f.into_iter()));
+    let bits = bits_builder.finalize().freeze();
+    let mut blocks = BytesMut::new();
+    let mut sblocks = BytesMut::new();
+    build_bitindex_from_buf(&bits[..], &mut blocks, &mut sblocks);
+    WaveletTree::from_parts(
+        BitIndex::from_maps(bits, blocks.freeze(), sblocks.freeze()),
+        width,
+    )
 }
 
 /// Build a wavelet tree from a file storing a logarray.

@@ -1149,7 +1149,11 @@ fn interval_component_to_iso(seconds: i64, nanos: u32, tz: i16) -> String {
     // clock is utc + tz minutes. INTERVAL_NO_ZONE renders without a
     // designator (local time per XBRL OIM), offset 0 renders as Z, other
     // offsets render as ±hh:mm.
-    let shift = if tz == INTERVAL_NO_ZONE { 0 } else { tz as i64 * 60 };
+    let shift = if tz == INTERVAL_NO_ZONE {
+        0
+    } else {
+        tz as i64 * 60
+    };
     let ndt = DateTime::from_timestamp(seconds + shift, nanos)
         .map(|dt| dt.naive_utc())
         .unwrap_or_else(|| {
@@ -1168,7 +1172,12 @@ fn interval_component_to_iso(seconds: i64, nanos: u32, tz: i16) -> String {
     } else if tz == 0 {
         "Z".to_string()
     } else {
-        format!("{}{:02}:{:02}", if tz < 0 { "-" } else { "+" }, tz.unsigned_abs() / 60, tz.unsigned_abs() % 60)
+        format!(
+            "{}{:02}:{:02}",
+            if tz < 0 { "-" } else { "+" },
+            tz.unsigned_abs() / 60,
+            tz.unsigned_abs() % 60
+        )
     };
     format!("{base}{suffix}")
 }
@@ -1188,7 +1197,8 @@ impl FromLexical<DateTimeInterval> for String {
         let dur_str = interval_duration_to_iso(&iv.duration);
         match iv.flag {
             INTERVAL_FLAG_START_DURATION => {
-                let start = interval_component_to_iso(iv.start_seconds, iv.start_nanos, iv.start_tz);
+                let start =
+                    interval_component_to_iso(iv.start_seconds, iv.start_nanos, iv.start_tz);
                 format!("{start}/{dur_str}")
             }
             INTERVAL_FLAG_DURATION_END => {
@@ -1196,7 +1206,8 @@ impl FromLexical<DateTimeInterval> for String {
                 format!("{dur_str}/{end}")
             }
             _ => {
-                let start = interval_component_to_iso(iv.start_seconds, iv.start_nanos, iv.start_tz);
+                let start =
+                    interval_component_to_iso(iv.start_seconds, iv.start_nanos, iv.start_tz);
                 let end = interval_component_to_iso(iv.end_seconds, iv.end_nanos, iv.end_tz);
                 format!("{start}/{end}")
             }

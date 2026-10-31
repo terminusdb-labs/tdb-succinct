@@ -1,11 +1,22 @@
+use std::ops::Range;
+
+use bytes::{BufMut, Bytes, BytesMut};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use thiserror::Error;
 
+use std::io;
+
+use super::block::IdLookupResult;
 use super::datatypes::{
-    DateTimeInterval, Duration, INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATETIME,
-    INTERVAL_FLAG_DURATION_END, INTERVAL_FLAG_EXPLICIT, INTERVAL_FLAG_START_DURATION,
-    INTERVAL_NO_ZONE,
+    Datatype, DateTimeInterval, Duration, FromLexical, ToLexical, INTERVAL_COMPONENT_DATE,
+    INTERVAL_COMPONENT_DATETIME, INTERVAL_ENCODED_WIDTH, INTERVAL_FLAG_DURATION_END,
+    INTERVAL_FLAG_EXPLICIT, INTERVAL_FLAG_START_DURATION, INTERVAL_NO_ZONE,
 };
+use super::typed::TypedDict;
+use crate::bitindex::BitIndex;
+use crate::logarray::{LogArray, LogArrayFileBuilder};
+use crate::storage::{FileLoad, FileStore};
+use crate::wavelettree::{build_wavelet_tree_from_iter, WaveletTree};
 
 #[derive(Debug, Error)]
 pub enum IntervalParseError {
@@ -129,7 +140,10 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
 /// When `is_end` is true and the component is a date, the date is bumped to the
 /// next calendar day, matching the half-open interval convention for unqualified
 /// ISO 8601 end dates.
-fn parse_date_or_datetime(s: &str, is_end: bool) -> Result<(i64, u32, u8, i16), IntervalParseError> {
+fn parse_date_or_datetime(
+    s: &str,
+    is_end: bool,
+) -> Result<(i64, u32, u8, i16), IntervalParseError> {
     if s.contains('T') {
         // DateTime: try RFC 3339 first (handles Z and numeric offsets and keeps
         // the offset), then fall back to naive datetimes which are local time.
@@ -447,10 +461,483 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 use chrono::Datelike;
 use chrono::Timelike;
 
+/// Number of tail bytes after the 24-byte sort prefix in the interval encoding.
+const INTERVAL_TAIL_WIDTH: usize = INTERVAL_ENCODED_WIDTH - 24;
+
+/// Craft a 52-byte probe key for a start boundary at `(secs, nanos)`. The tail
+/// decides the ordering relative to entries sharing that start: `max_tail`
+/// sorts the probe after every real entry (a real start_type byte can never be
+/// 0xFF), `!max_tail` sorts it before them except a pathological all-zero
+/// entry, which is reported via `IdLookupResult::Found`.
+fn interval_probe_key(secs: i64, nanos: u32, max_tail: bool) -> Bytes {
+    let mut buf = BytesMut::with_capacity(INTERVAL_ENCODED_WIDTH);
+    buf.extend_from_slice(&secs.to_lexical());
+    buf.put_u32(nanos);
+    if max_tail {
+        buf.extend_from_slice(&i64::MAX.to_lexical());
+        buf.put_u32(u32::MAX);
+        buf.extend_from_slice(&[0xFF; INTERVAL_TAIL_WIDTH]);
+    } else {
+        buf.extend_from_slice(&i64::MIN.to_lexical());
+        buf.put_u32(0);
+        buf.extend_from_slice(&[0; INTERVAL_TAIL_WIDTH]);
+    }
+    buf.freeze()
+}
+
+impl TypedDict {
+    /// Global id range `[offset+1, offset+1+n)` of the DateTimeInterval segment.
+    pub fn interval_segment(&self) -> Option<Range<u64>> {
+        self.type_segment(Datatype::DateTimeInterval)
+            .map(|(d, off)| (off + 1)..(off + 1 + d.num_entries() as u64))
+    }
+
+    /// Binary-search a crafted probe key within the interval segment. Returns
+    /// `(k, found)` where `k` is the global 1-based id of the greatest entry
+    /// less than the probe (or the entry itself when `found`).
+    fn interval_probe(&self, secs: i64, nanos: u32, max_tail: bool) -> Option<(u64, bool)> {
+        match self.id_slice(
+            Datatype::DateTimeInterval,
+            &interval_probe_key(secs, nanos, max_tail),
+        ) {
+            IdLookupResult::Found(k) => Some((k, true)),
+            IdLookupResult::Closest(k) => Some((k, false)),
+            IdLookupResult::NotFound => None,
+        }
+    }
+
+    /// Ids of `DateTimeInterval` entries with `start <= (secs, nanos)`,
+    /// as a half-open global id range.
+    pub fn interval_ids_start_le(&self, secs: i64, nanos: u32) -> Range<u64> {
+        let Some(seg) = self.interval_segment() else {
+            return 0..0;
+        };
+        match self.interval_probe(secs, nanos, true) {
+            Some((k, _)) => seg.start..(k + 1).min(seg.end),
+            None => 0..0,
+        }
+    }
+
+    /// Ids of entries with `start < (secs, nanos)`.
+    pub fn interval_ids_start_lt(&self, secs: i64, nanos: u32) -> Range<u64> {
+        let Some(seg) = self.interval_segment() else {
+            return 0..0;
+        };
+        match self.interval_probe(secs, nanos, false) {
+            Some((k, found)) => seg.start..(if found { k } else { k + 1 }).min(seg.end),
+            None => 0..0,
+        }
+    }
+
+    /// Ids of entries with `start > (secs, nanos)`.
+    pub fn interval_ids_start_gt(&self, secs: i64, nanos: u32) -> Range<u64> {
+        let Some(seg) = self.interval_segment() else {
+            return 0..0;
+        };
+        match self.interval_probe(secs, nanos, true) {
+            Some((k, _)) => (k + 1).clamp(seg.start, seg.end)..seg.end,
+            None => 0..0,
+        }
+    }
+
+    /// Ids of entries with `start >= (secs, nanos)`.
+    pub fn interval_ids_start_ge(&self, secs: i64, nanos: u32) -> Range<u64> {
+        let Some(seg) = self.interval_segment() else {
+            return 0..0;
+        };
+        match self.interval_probe(secs, nanos, false) {
+            Some((k, found)) => (if found { k } else { k + 1 }).clamp(seg.start, seg.end)..seg.end,
+            None => 0..0,
+        }
+    }
+
+    /// Ids of entries with `start == (secs, nanos)`.
+    pub fn interval_ids_start_eq(&self, secs: i64, nanos: u32) -> Range<u64> {
+        let Some(seg) = self.interval_segment() else {
+            return 0..0;
+        };
+        let lo = match self.interval_probe(secs, nanos, false) {
+            Some((k, found)) => (if found { k } else { k + 1 }).clamp(seg.start, seg.end),
+            None => return 0..0,
+        };
+        let hi = match self.interval_probe(secs, nanos, true) {
+            Some((k, _)) => (k + 1).min(seg.end),
+            None => return 0..0,
+        };
+        lo..hi.max(lo)
+    }
+}
+
+/// Dense-rank index on interval end timestamps over a TypedDict's
+/// DateTimeInterval segment.
+///
+/// `ends` is a stride-2 LogArray of the sorted distinct `(end_secs,
+/// end_nanos)` keys; `tree` encodes each segment position's end rank.
+/// Positions are 0-based within the interval segment.
+pub struct IntervalEndIndex {
+    ends: LogArray,
+    tree: WaveletTree,
+}
+
+/// Wavelet alphabet width needed to encode `n` distinct end ranks.
+/// Minimum 1: width 0 would yield an empty tree of length 0.
+fn end_rank_width(n: usize) -> u8 {
+    (u64::BITS - n.saturating_sub(1).leading_zeros()).max(1) as u8
+}
+
+impl IntervalEndIndex {
+    pub fn from_parts(ends: LogArray, bits: BitIndex) -> Self {
+        let tree = WaveletTree::from_parts(bits, end_rank_width(ends.len() / 2));
+        IntervalEndIndex { ends, tree }
+    }
+
+    /// Number of interval positions covered.
+    pub fn len(&self) -> usize {
+        self.tree.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tree.len() == 0
+    }
+
+    /// Number of distinct end keys in the rank table.
+    pub fn num_distinct_ends(&self) -> usize {
+        self.ends.len() / 2
+    }
+
+    /// First rank whose end key is `>= (secs, nanos)`.
+    pub fn end_lower_bound(&self, secs: i64, nanos: u32) -> u64 {
+        self.end_search(secs, nanos, false)
+    }
+
+    /// First rank whose end key is `> (secs, nanos)`.
+    pub fn end_upper_bound(&self, secs: i64, nanos: u32) -> u64 {
+        self.end_search(secs, nanos, true)
+    }
+
+    fn end_search(&self, secs: i64, nanos: u32, upper: bool) -> u64 {
+        let n = self.num_distinct_ends() as u64;
+        let (mut lo, mut hi) = (0u64, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let s = self.ends.entry((2 * mid) as usize) as i64;
+            let ns = self.ends.entry((2 * mid + 1) as usize) as u32;
+            let before = if upper {
+                (s, ns) <= (secs, nanos)
+            } else {
+                (s, ns) < (secs, nanos)
+            };
+            if before {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Segment positions in `pos` with `end <= (secs, nanos)`.
+    pub fn positions_end_le(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        match self.end_upper_bound(secs, nanos) {
+            0 => Vec::new(),
+            hi => self.tree.positions_le(pos, hi - 1),
+        }
+    }
+
+    /// Segment positions in `pos` with `end < (secs, nanos)`.
+    pub fn positions_end_lt(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        match self.end_lower_bound(secs, nanos) {
+            0 => Vec::new(),
+            hi => self.tree.positions_le(pos, hi - 1),
+        }
+    }
+
+    /// Segment positions in `pos` with `end >= (secs, nanos)`.
+    pub fn positions_end_ge(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        self.tree
+            .positions_ge(pos, self.end_lower_bound(secs, nanos))
+    }
+
+    /// Segment positions in `pos` with `end > (secs, nanos)`.
+    pub fn positions_end_gt(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        self.tree
+            .positions_ge(pos, self.end_upper_bound(secs, nanos))
+    }
+
+    /// Segment positions in `pos` with `end == (secs, nanos)`.
+    pub fn positions_end_eq(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
+        let lo = self.end_lower_bound(secs, nanos);
+        let hi = self.end_upper_bound(secs, nanos);
+        if lo >= hi {
+            Vec::new()
+        } else {
+            self.tree.positions_in_range(pos, lo, hi - 1)
+        }
+    }
+
+    /// Segment positions in `pos` with `end` in `[lo, hi]` inclusive.
+    pub fn positions_end_range(&self, pos: Range<u64>, lo: (i64, u32), hi: (i64, u32)) -> Vec<u64> {
+        let r_lo = self.end_lower_bound(lo.0, lo.1);
+        let r_hi = self.end_upper_bound(hi.0, hi.1);
+        if r_lo >= r_hi {
+            Vec::new()
+        } else {
+            self.tree.positions_in_range(pos, r_lo, r_hi - 1)
+        }
+    }
+}
+
+/// Build the interval end index for a dictionary's DateTimeInterval segment
+/// into four files: the stride-2 end rank table (`ends`), and the wavelet
+/// tree's `bits`, `blocks` and `sblocks`.
+pub async fn build_interval_end_index<F: 'static + FileLoad + FileStore>(
+    dict: &TypedDict,
+    destination_ends: F,
+    destination_bits: F,
+    destination_blocks: F,
+    destination_sblocks: F,
+) -> io::Result<()> {
+    let mut ends: Vec<(i64, u32)> = Vec::new();
+    if let Some(seg) = dict.interval_segment() {
+        for id in seg {
+            let entry = dict.entry(id as usize).expect("interval id in segment");
+            let iv =
+                <DateTimeInterval as FromLexical<DateTimeInterval>>::from_lexical(entry.to_bytes());
+            ends.push((iv.end_seconds, iv.end_nanos));
+        }
+    }
+
+    let mut distinct = ends.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+
+    // stride-2 rank table: (secs bitcast, nanos) pairs, sorted
+    let mut ends_builder = LogArrayFileBuilder::new(destination_ends.open_write().await?, 64);
+    for &(s, n) in &distinct {
+        ends_builder.push(s as u64).await?;
+        ends_builder.push(n as u64).await?;
+    }
+    ends_builder.finalize().await?;
+
+    // rank of each position's end key
+    let ranks: Vec<u64> = ends
+        .iter()
+        .map(|e| distinct.binary_search(e).unwrap() as u64)
+        .collect();
+    // alphabet must cover the distinct count
+    let width = end_rank_width(distinct.len());
+    build_wavelet_tree_from_iter(
+        width,
+        ranks.into_iter(),
+        destination_bits,
+        destination_blocks,
+        destination_sblocks,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tfc::datatypes::{FromLexical, TdbDataType, ToLexical};
+    use crate::tfc::typed::{TypedDictBufBuilder, TypedDictEntry};
+
+    fn iv(s: &str) -> TypedDictEntry {
+        DateTimeInterval::make_entry(&parse_iso_interval(s).unwrap())
+    }
+
+    fn build_dict(mut entries: Vec<TypedDictEntry>) -> TypedDict {
+        entries.sort();
+        let mut b = TypedDictBufBuilder::new(
+            BytesMut::new(),
+            BytesMut::new(),
+            BytesMut::new(),
+            BytesMut::new(),
+        );
+        b.add_all(entries.into_iter());
+        let (t, o, bo, d) = b.finalize();
+        TypedDict::from_parts(t.freeze(), o.freeze(), bo.freeze(), d.freeze())
+    }
+
+    /// Two strings (ids 1-2) then four intervals (ids 3-6):
+    /// 3: start 2025-01-01, 4-5: start 2025-03-01 (duplicate, different ends),
+    /// 6: start 2025-06-01.
+    fn interval_dict() -> TypedDict {
+        build_dict(vec![
+            String::make_entry(&"alpha".to_string()),
+            String::make_entry(&"beta".to_string()),
+            iv("2025-01-01/2025-02-01"),
+            iv("2025-03-01/2025-04-01"),
+            iv("2025-03-01/2025-05-01"),
+            iv("2025-06-01/2025-07-01"),
+        ])
+    }
+
+    const S1: i64 = 1735689600; // 2025-01-01T00:00:00Z
+    const S2: i64 = 1740787200; // 2025-03-01T00:00:00Z
+    const S4: i64 = 1748736000; // 2025-06-01T00:00:00Z
+
+    #[test]
+    fn probe_start_le_includes_equal_start() {
+        let dict = interval_dict();
+        assert_eq!(3..6, dict.interval_ids_start_le(S2, 0));
+        assert_eq!(3..7, dict.interval_ids_start_le(S4, 0));
+    }
+
+    #[test]
+    fn probe_start_lt_excludes_equal_start() {
+        let dict = interval_dict();
+        assert_eq!(3..4, dict.interval_ids_start_lt(S2, 0));
+    }
+
+    #[test]
+    fn probe_start_gt_excludes_equal_start() {
+        let dict = interval_dict();
+        assert_eq!(6..7, dict.interval_ids_start_gt(S2, 0));
+    }
+
+    #[test]
+    fn probe_start_ge_includes_equal_start() {
+        let dict = interval_dict();
+        assert_eq!(4..7, dict.interval_ids_start_ge(S2, 0));
+    }
+
+    #[test]
+    fn probe_start_eq_range_over_duplicate_starts() {
+        let dict = interval_dict();
+        assert_eq!(4..6, dict.interval_ids_start_eq(S2, 0));
+        assert_eq!(3..4, dict.interval_ids_start_eq(S1, 0));
+    }
+
+    #[test]
+    fn probe_boundaries_and_missing_segment() {
+        let dict = interval_dict();
+        // Below first start / above last start
+        assert_eq!(3..3, dict.interval_ids_start_le(S1 - 1, 0));
+        assert_eq!(7..7, dict.interval_ids_start_gt(S4, 0));
+        // Between two starts
+        assert_eq!(3..4, dict.interval_ids_start_le(S1 + 1, 0));
+        assert_eq!(4..7, dict.interval_ids_start_gt(S1 + 1, 0));
+        // No interval segment at all
+        let str_dict = build_dict(vec![String::make_entry(&"only".to_string())]);
+        assert_eq!(0..0, str_dict.interval_ids_start_le(S2, 0));
+        assert_eq!(0..0, str_dict.interval_ids_start_eq(S2, 0));
+    }
+
+    fn build_end_index(dict: &TypedDict) -> IntervalEndIndex {
+        use crate::storage::memory::MemoryBackedStore;
+        use futures::executor::block_on;
+
+        let ends_f = MemoryBackedStore::new();
+        let bits_f = MemoryBackedStore::new();
+        let blocks_f = MemoryBackedStore::new();
+        let sblocks_f = MemoryBackedStore::new();
+        block_on(build_interval_end_index(
+            dict,
+            ends_f.clone(),
+            bits_f.clone(),
+            blocks_f.clone(),
+            sblocks_f.clone(),
+        ))
+        .unwrap();
+        let ends = LogArray::parse(block_on(ends_f.map()).unwrap()).unwrap();
+        let bits = BitIndex::from_maps(
+            block_on(bits_f.map()).unwrap(),
+            block_on(blocks_f.map()).unwrap(),
+            block_on(sblocks_f.map()).unwrap(),
+        );
+        IntervalEndIndex::from_parts(ends, bits)
+    }
+
+    /// Decoded (end_secs, end_nanos) per segment position for a dict.
+    fn segment_ends(dict: &TypedDict) -> Vec<(i64, u32)> {
+        dict.interval_segment()
+            .map(|seg| {
+                seg.map(|id| {
+                    let e = dict.entry(id as usize).unwrap();
+                    let iv = <DateTimeInterval as FromLexical<DateTimeInterval>>::from_lexical(
+                        e.to_bytes(),
+                    );
+                    (iv.end_seconds, iv.end_nanos)
+                })
+                .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn interval_end_index_matches_scan() {
+        // intervals with distinct, duplicate and boundary ends
+        let dict = build_dict(vec![
+            iv("2025-01-01/2025-02-01"),
+            iv("2025-02-01/2025-03-01"),
+            iv("2025-03-01/2025-03-01"), // empty interval, end == mid values
+            iv("2025-04-01/2025-03-15"),
+            iv("2025-05-01/2025-06-01"),
+        ]);
+        let ends = segment_ends(&dict);
+        let idx = build_end_index(&dict);
+        let n = ends.len() as u64;
+        assert_eq!(n as usize, idx.len());
+
+        let scan = |pred: &dyn Fn((i64, u32)) -> bool, pos: Range<u64>| -> Vec<u64> {
+            (pos.start..pos.end.min(ends.len() as u64))
+                .filter(|&i| pred(ends[i as usize]))
+                .collect()
+        };
+        let t = |s: &str| {
+            let iv = parse_iso_interval(&format!("{s}/{s}")).unwrap();
+            (iv.end_seconds, iv.end_nanos)
+        };
+        let t_mar1 = t("2025-03-01");
+        let t_mar15 = t("2025-03-15");
+
+        for pos in [0..n, 1..4, 0..0] {
+            assert_eq!(
+                scan(&|e| e <= t_mar1, pos.clone()),
+                idx.positions_end_le(pos.clone(), t_mar1.0, t_mar1.1)
+            );
+            assert_eq!(
+                scan(&|e| e < t_mar15, pos.clone()),
+                idx.positions_end_lt(pos.clone(), t_mar15.0, t_mar15.1)
+            );
+            assert_eq!(
+                scan(&|e| e >= t_mar1, pos.clone()),
+                idx.positions_end_ge(pos.clone(), t_mar1.0, t_mar1.1)
+            );
+            assert_eq!(
+                scan(&|e| e > t_mar1, pos.clone()),
+                idx.positions_end_gt(pos.clone(), t_mar1.0, t_mar1.1)
+            );
+            assert_eq!(
+                scan(&|e| e == t_mar1, pos.clone()),
+                idx.positions_end_eq(pos.clone(), t_mar1.0, t_mar1.1)
+            );
+            assert_eq!(
+                scan(&|e| e >= t_mar1 && e <= t_mar15, pos.clone()),
+                idx.positions_end_range(pos.clone(), t_mar1, t_mar15)
+            );
+        }
+        // bounds outside the present keys
+        assert!(idx.positions_end_le(0..n, 0, 0).is_empty());
+        assert_eq!(5, idx.positions_end_ge(0..n, 0, 0).len());
+        assert_eq!(
+            n as usize,
+            idx.positions_end_range(0..n, (0, 0), (i64::MAX, u32::MAX))
+                .len()
+        );
+    }
+
+    #[test]
+    fn probe_nanos_distinguish_same_second() {
+        // Two entries with the same start second, nanos 0 and 500
+        let dict = build_dict(vec![
+            iv("2025-01-01T00:00:00Z/2025-02-01"),
+            iv("2025-01-01T00:00:00.5Z/2025-02-01"),
+        ]);
+        assert_eq!(1..2, dict.interval_ids_start_lt(S1, 500_000_000));
+        assert_eq!(2..3, dict.interval_ids_start_ge(S1, 500_000_000));
+    }
 
     #[test]
     fn parse_explicit_dates() {
@@ -535,7 +1022,10 @@ mod tests {
         let s = "2025-01-01T09:00:00.000+02:00/2025-01-01T09:00:00.123456789+02:00";
         let iv = parse_iso_interval(s).unwrap();
         let round = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
-        assert_eq!(round, "2025-01-01T09:00:00+02:00/2025-01-01T09:00:00.123456789+02:00");
+        assert_eq!(
+            round,
+            "2025-01-01T09:00:00+02:00/2025-01-01T09:00:00.123456789+02:00"
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ use super::util;
 
 use std::convert::TryInto;
 use std::io;
+use std::ops::Range;
 
 /// A wavelet tree, encoding a u64 array for fast lookup of number positions.
 ///
@@ -206,6 +207,52 @@ impl WaveletTree {
     pub fn lookup_one(&self, entry: u64) -> Option<u64> {
         self.lookup(entry).map(|l| l.entry(0))
     }
+
+    /// Returns the positions in `pos` whose values lie in `[val_lo, val_hi]`,
+    /// sorted ascending. Positions outside `0..self.len()` are clamped.
+    ///
+    /// Enumerates the distinct values present, looks up each in-range value
+    /// and filters positions by the window: O(n + sigma_range log sigma).
+    /// shortcut: full-tree DFS pruning would skip the decode pass, but the
+    /// position-restricted child-window math is subtle; revisit if profiling
+    /// shows the decode scan dominates.
+    pub fn positions_in_range(&self, pos: Range<u64>, val_lo: u64, val_hi: u64) -> Vec<u64> {
+        let pos_hi = pos.end.min(self.len() as u64);
+        if self.num_layers == 0 || pos.start >= pos_hi || val_lo > val_hi {
+            return Vec::new();
+        }
+
+        let mut values: Vec<u64> = self
+            .decode()
+            .filter(|v| *v >= val_lo && *v <= val_hi)
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+
+        let mut out = Vec::new();
+        for v in values {
+            if let Some(lookup) = self.lookup(v) {
+                out.extend(lookup.iter().filter(|p| *p >= pos.start && *p < pos_hi));
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Positions in `pos` with value `<= val`.
+    pub fn positions_le(&self, pos: Range<u64>, val: u64) -> Vec<u64> {
+        self.positions_in_range(pos, 0, val)
+    }
+
+    /// Positions in `pos` with value `>= val`.
+    pub fn positions_ge(&self, pos: Range<u64>, val: u64) -> Vec<u64> {
+        self.positions_in_range(pos, val, u64::MAX)
+    }
+
+    /// Positions in `pos` with value `== val`.
+    pub fn positions_eq(&self, pos: Range<u64>, val: u64) -> Vec<u64> {
+        self.positions_in_range(pos, val, val)
+    }
 }
 
 #[derive(Debug)]
@@ -370,6 +417,87 @@ mod tests {
 
     use super::*;
     use futures::executor::block_on;
+
+    fn build_tree(contents: &[u64], width: u8) -> WaveletTree {
+        let bits_file = MemoryBackedStore::new();
+        let blocks_file = MemoryBackedStore::new();
+        let sblocks_file = MemoryBackedStore::new();
+        block_on(build_wavelet_tree_from_iter(
+            width,
+            contents.to_vec().into_iter(),
+            bits_file.clone(),
+            blocks_file.clone(),
+            sblocks_file.clone(),
+        ))
+        .unwrap();
+        let bitindex = BitIndex::from_maps(
+            block_on(bits_file.map()).unwrap(),
+            block_on(blocks_file.map()).unwrap(),
+            block_on(sblocks_file.map()).unwrap(),
+        );
+        WaveletTree::from_parts(bitindex, width)
+    }
+
+    /// Reference implementation: positions in `pos` with value in [lo,hi].
+    fn expected(contents: &[u64], pos: Range<u64>, lo: u64, hi: u64) -> Vec<u64> {
+        let start = pos.start as usize;
+        let end = (pos.end as usize).min(contents.len());
+        (start.max(0)..end)
+            .filter(|&i| contents[i] >= lo && contents[i] <= hi)
+            .map(|i| i as u64)
+            .collect()
+    }
+
+    #[test]
+    fn positions_in_range_matches_brute_force() {
+        let contents = vec![21, 1, 30, 13, 23, 21, 3, 0, 21, 21, 12, 11];
+        let tree = build_tree(&contents, 5);
+        let n = contents.len() as u64;
+        // sweep position windows and value windows against the source vector
+        for pos in [0..n, 2..9, 0..3, n..n + 2, 0..0] {
+            for (lo, hi) in [(0, 31), (11, 21), (0, 0), (21, 21), (25, 28), (1, 0)] {
+                assert_eq!(
+                    expected(&contents, pos.clone(), lo, hi),
+                    tree.positions_in_range(pos.clone(), lo, hi),
+                    "pos={pos:?} lo={lo} hi={hi}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn positions_le_ge_eq_match_brute_force() {
+        let contents = vec![5, 5, 5, 9, 1, 9, 5];
+        let tree = build_tree(&contents, 4);
+        let n = contents.len() as u64;
+        for pos in [0..n, 1..6] {
+            assert_eq!(
+                expected(&contents, pos.clone(), 0, 5),
+                tree.positions_le(pos.clone(), 5)
+            );
+            assert_eq!(
+                expected(&contents, pos.clone(), 9, u64::MAX),
+                tree.positions_ge(pos.clone(), 9)
+            );
+            assert_eq!(
+                expected(&contents, pos.clone(), 1, 1),
+                tree.positions_eq(pos.clone(), 1)
+            );
+        }
+        // values outside the alphabet: above max, and below via eq
+        assert!(tree.positions_in_range(0..n, 10, 15).is_empty());
+        assert!(tree.positions_ge(0..n, 10).is_empty());
+        assert_eq!(vec![4], tree.positions_eq(0..n, 1));
+    }
+
+    #[test]
+    fn positions_in_range_single_value_and_empty_tree() {
+        let tree = build_tree(&[7, 7, 7], 3);
+        assert_eq!(vec![0, 1, 2], tree.positions_in_range(0..3, 0, u64::MAX));
+        assert_eq!(vec![1], tree.positions_in_range(1..2, 7, 7));
+        let empty = build_tree(&[], 0);
+        assert!(empty.positions_in_range(0..5, 0, u64::MAX).is_empty());
+    }
 
     #[test]
     fn generate_and_decode_wavelet_tree_from_vec() {

@@ -1,9 +1,10 @@
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use thiserror::Error;
 
 use super::datatypes::{
     DateTimeInterval, Duration, INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATETIME,
     INTERVAL_FLAG_DURATION_END, INTERVAL_FLAG_EXPLICIT, INTERVAL_FLAG_START_DURATION,
+    INTERVAL_NO_ZONE,
 };
 
 #[derive(Debug, Error)]
@@ -61,9 +62,9 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
     }
 
     if left_is_duration {
-        // duration/end
+        // duration/end — the computed start inherits the end's supplied zone
         let duration = parse_iso_duration(left)?;
-        let (end_seconds, end_nanos, end_type) = parse_date_or_datetime(right, true)?;
+        let (end_seconds, end_nanos, end_type, end_tz) = parse_date_or_datetime(right, true)?;
         let (start_seconds, start_nanos) =
             compute_start_from_duration_and_end(&duration, end_seconds, end_nanos);
         let start_type = end_type;
@@ -76,10 +77,13 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
             end_type,
             flag: INTERVAL_FLAG_DURATION_END,
             duration,
+            start_tz: end_tz,
+            end_tz,
         })
     } else if right_is_duration {
-        // start/duration
-        let (start_seconds, start_nanos, start_type) = parse_date_or_datetime(left, false)?;
+        // start/duration — the computed end inherits the start's supplied zone
+        let (start_seconds, start_nanos, start_type, start_tz) =
+            parse_date_or_datetime(left, false)?;
         let duration = parse_iso_duration(right)?;
         let (end_seconds, end_nanos) =
             compute_end_from_start_and_duration(&duration, start_seconds, start_nanos);
@@ -93,11 +97,14 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
             end_type,
             flag: INTERVAL_FLAG_START_DURATION,
             duration,
+            start_tz,
+            end_tz: start_tz,
         })
     } else {
         // start/end (explicit)
-        let (start_seconds, start_nanos, start_type) = parse_date_or_datetime(left, false)?;
-        let (end_seconds, end_nanos, end_type) = parse_date_or_datetime(right, true)?;
+        let (start_seconds, start_nanos, start_type, start_tz) =
+            parse_date_or_datetime(left, false)?;
+        let (end_seconds, end_nanos, end_type, end_tz) = parse_date_or_datetime(right, true)?;
         let duration =
             compute_duration_from_endpoints(start_seconds, start_nanos, end_seconds, end_nanos);
         Ok(DateTimeInterval {
@@ -109,41 +116,50 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
             end_type,
             flag: INTERVAL_FLAG_EXPLICIT,
             duration,
+            start_tz,
+            end_tz,
         })
     }
 }
 
 /// Parse a date (`YYYY-MM-DD`) or datetime (`YYYY-MM-DDTHH:MM:SS[.fff][Z|+hh:mm|-hh:mm]`) string.
-/// Returns (unix_seconds, nanos, component_type). All datetimes are converted to UTC.
+/// Returns (unix_seconds, nanos, component_type, tz_offset_minutes). The instant is
+/// always UTC; the offset is the supplied zone designator in minutes (`Z` and
+/// date components give 0), or `INTERVAL_NO_ZONE` for a zone-less datetime.
 /// When `is_end` is true and the component is a date, the date is bumped to the
 /// next calendar day, matching the half-open interval convention for unqualified
 /// ISO 8601 end dates.
-fn parse_date_or_datetime(s: &str, is_end: bool) -> Result<(i64, u32, u8), IntervalParseError> {
+fn parse_date_or_datetime(s: &str, is_end: bool) -> Result<(i64, u32, u8, i16), IntervalParseError> {
     if s.contains('T') {
-        // DateTime: try RFC 3339 first (handles Z and numeric offsets), then fall
-        // back to naive ISO 8601 datetimes which are interpreted as UTC.
-        let dt = DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.with_timezone(&Utc))
-            .or_else(|_| {
-                NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-                    .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
-                    .map(|ndt| ndt.and_utc())
-            })
+        // DateTime: try RFC 3339 first (handles Z and numeric offsets and keeps
+        // the offset), then fall back to naive datetimes which are local time.
+        if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+            return Ok((
+                dt.timestamp(),
+                dt.timestamp_subsec_nanos(),
+                INTERVAL_COMPONENT_DATETIME,
+                (dt.offset().local_minus_utc() / 60) as i16,
+            ));
+        }
+        let ndt = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+            .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
             .map_err(|_| IntervalParseError::InvalidDateTime(s.to_string()))?;
+        let dt = ndt.and_utc();
         Ok((
             dt.timestamp(),
             dt.timestamp_subsec_nanos(),
             INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_NO_ZONE,
         ))
     } else {
-        // Date only
+        // Date only — treated as a whole UTC day, so offset 0 (renders as Z).
         let mut nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
             .map_err(|_| IntervalParseError::InvalidDate(s.to_string()))?;
         if is_end {
             nd = nd.succ_opt().unwrap_or(nd);
         }
         let ndt = nd.and_hms_opt(0, 0, 0).unwrap();
-        Ok((ndt.and_utc().timestamp(), 0, INTERVAL_COMPONENT_DATE))
+        Ok((ndt.and_utc().timestamp(), 0, INTERVAL_COMPONENT_DATE, 0))
     }
 }
 
@@ -467,7 +483,7 @@ mod tests {
 
     #[test]
     fn parse_explicit_datetime_with_timezone_offset_and_nanos() {
-        // +02:00 means the local 09:00:00 is 07:00:00Z.
+        // +02:00 means the local 09:00:00 is 07:00:00Z; the offset is kept.
         let s = "2025-01-01T09:00:00.000+02:00/2025-01-01T09:00:00.123456789+02:00";
         let iv = parse_iso_interval(s).unwrap();
         assert_eq!(iv.start_seconds, 1735689600 + 7 * 3600);
@@ -475,14 +491,67 @@ mod tests {
         assert_eq!(iv.end_seconds, 1735689600 + 7 * 3600);
         assert_eq!(iv.end_nanos, 123_456_789);
         assert_eq!(iv.duration.second, 0.123456789);
+        assert_eq!(iv.start_tz, 120);
+        assert_eq!(iv.end_tz, 120);
+    }
+
+    #[test]
+    fn parse_zoneless_datetime_is_local() {
+        // XBRL OIM: a datetime without a zone designator is local time and
+        // must stay distinguishable from UTC.
+        let iv = parse_iso_interval("2025-01-01T09:00:00/2025-03-31T18:30:00").unwrap();
+        assert_eq!(iv.start_tz, INTERVAL_NO_ZONE);
+        assert_eq!(iv.end_tz, INTERVAL_NO_ZONE);
+        assert_eq!(iv.start_seconds, 1735722000); // stored as the UTC instant
+    }
+
+    #[test]
+    fn parse_z_datetime_is_offset_zero() {
+        let iv = parse_iso_interval("2025-01-01T09:00:00Z/2025-01-02T00:00:00Z").unwrap();
+        assert_eq!(iv.start_tz, 0);
+        assert_eq!(iv.end_tz, 0);
+    }
+
+    #[test]
+    fn parse_dates_keep_utc_convention() {
+        let iv = parse_iso_interval("2025-01-01/2025-03-31").unwrap();
+        assert_eq!(iv.start_tz, 0);
+        assert_eq!(iv.end_tz, 0);
+    }
+
+    #[test]
+    fn duration_forms_inherit_supplied_zone() {
+        let iv = parse_iso_interval("2025-01-01T09:00:00+02:00/P3M").unwrap();
+        assert_eq!(iv.start_tz, 120);
+        assert_eq!(iv.end_tz, 120);
+        let iv = parse_iso_interval("P3M/2025-04-01T09:00:00-05:00").unwrap();
+        assert_eq!(iv.start_tz, -300);
+        assert_eq!(iv.end_tz, -300);
     }
 
     #[test]
     fn roundtrip_explicit_datetime_with_timezone_offset_and_nanos() {
+        // OIM fidelity: the supplied offset round-trips instead of normalizing to Z.
         let s = "2025-01-01T09:00:00.000+02:00/2025-01-01T09:00:00.123456789+02:00";
         let iv = parse_iso_interval(s).unwrap();
         let round = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
-        assert_eq!(round, "2025-01-01T07:00:00Z/2025-01-01T07:00:00.123456789Z");
+        assert_eq!(round, "2025-01-01T09:00:00+02:00/2025-01-01T09:00:00.123456789+02:00");
+    }
+
+    #[test]
+    fn roundtrip_zoneless_datetime_stays_zoneless() {
+        let s = "2025-01-01T09:00:00/2025-03-31T18:30:00";
+        let iv = parse_iso_interval(s).unwrap();
+        let round = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!(round, s);
+    }
+
+    #[test]
+    fn roundtrip_mixed_zones() {
+        let s = "2025-01-01T09:00:00-05:00/2025-03-31T18:30:00+05:30";
+        let iv = parse_iso_interval(s).unwrap();
+        let round = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+        assert_eq!(round, s);
     }
 
     #[test]
@@ -732,11 +801,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_datetime_with_offset_roundtrips_to_utc() {
+    fn parse_datetime_with_offset_roundtrips_supplied_zone() {
         let iv = parse_iso_interval("2025-01-01T10:30:00+02:00/2025-04-01T15:45:00+02:00").unwrap();
         let bytes = iv.to_lexical();
         let s = <String as FromLexical<DateTimeInterval>>::from_lexical(bytes);
-        assert_eq!("2025-01-01T08:30:00Z/2025-04-01T13:45:00Z", s);
+        assert_eq!("2025-01-01T10:30:00+02:00/2025-04-01T15:45:00+02:00", s);
     }
 
     #[test]

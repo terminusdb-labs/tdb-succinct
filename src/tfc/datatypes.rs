@@ -1054,12 +1054,24 @@ pub const INTERVAL_FLAG_EXPLICIT: u8 = 0;
 pub const INTERVAL_FLAG_START_DURATION: u8 = 1;
 pub const INTERVAL_FLAG_DURATION_END: u8 = 2;
 
-/// A date-time interval with materialized start/end, preserved duration, and
-/// a flag recording the original input form.
+/// Sentinel for a zone-less (local-time) interval endpoint.
+/// Valid offsets are ±14:00 in minutes, far inside i16 range.
+pub const INTERVAL_NO_ZONE: i16 = i16::MIN;
+
+/// Encoded width of a DateTimeInterval entry.
+pub const INTERVAL_ENCODED_WIDTH: usize = 52;
+
+/// A date-time interval with materialized start/end, preserved duration,
+/// the supplied UTC offsets, and a flag recording the original input form.
 ///
-/// Binary encoding (48 bytes fixed-width):
+/// Binary encoding (52 bytes fixed-width):
 /// - Sorting prefix (24 bytes): start_seconds(i64) + start_nanos(u32) + end_seconds(i64) + end_nanos(u32)
-/// - Metadata suffix (24 bytes): start_type(u8) + end_type(u8) + flag(u8) + duration(21 bytes)
+/// - Metadata (28 bytes): start_type(u8) + end_type(u8) + flag(u8) + duration(21 bytes) + start_tz(i16) + end_tz(i16)
+///
+/// `start_tz`/`end_tz` hold the client-supplied UTC offset in minutes, or
+/// `INTERVAL_NO_ZONE` for a zone-less (local-time) endpoint. The stored
+/// instant is always UTC; the offsets are lexical metadata only and do not
+/// affect ordering.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DateTimeInterval {
     pub start_seconds: i64,
@@ -1070,6 +1082,8 @@ pub struct DateTimeInterval {
     pub end_type: u8,
     pub flag: u8,
     pub duration: Duration,
+    pub start_tz: i16,
+    pub end_tz: i16,
 }
 
 impl TdbDataType for DateTimeInterval {
@@ -1091,12 +1105,20 @@ impl ToLexical<DateTimeInterval> for DateTimeInterval {
         buf.put_u8(self.end_type);
         buf.put_u8(self.flag);
         buf.extend_from_slice(&self.duration.to_lexical());
+        buf.put_i16(self.start_tz);
+        buf.put_i16(self.end_tz);
         buf.freeze()
     }
 }
 
 impl FromLexical<DateTimeInterval> for DateTimeInterval {
     fn from_lexical<B: Buf>(mut b: B) -> Self {
+        assert!(
+            b.remaining() == INTERVAL_ENCODED_WIDTH,
+            "invalid DateTimeInterval encoding width: expected {}, got {}",
+            INTERVAL_ENCODED_WIDTH,
+            b.remaining()
+        );
         let start_seconds = i64::from_lexical(&mut b);
         let start_nanos = b.get_u32();
         let end_seconds = i64::from_lexical(&mut b);
@@ -1105,6 +1127,8 @@ impl FromLexical<DateTimeInterval> for DateTimeInterval {
         let end_type = b.get_u8();
         let flag = b.get_u8();
         let duration = Duration::from_lexical(&mut b);
+        let start_tz = b.get_i16();
+        let end_tz = b.get_i16();
         DateTimeInterval {
             start_seconds,
             start_nanos,
@@ -1114,12 +1138,19 @@ impl FromLexical<DateTimeInterval> for DateTimeInterval {
             end_type,
             flag,
             duration,
+            start_tz,
+            end_tz,
         }
     }
 }
 
-fn interval_component_to_iso(seconds: i64, nanos: u32) -> String {
-    let ndt = DateTime::from_timestamp(seconds, nanos)
+fn interval_component_to_iso(seconds: i64, nanos: u32, tz: i16) -> String {
+    // Render in the supplied zone: the instant is UTC, so the local wall
+    // clock is utc + tz minutes. INTERVAL_NO_ZONE renders without a
+    // designator (local time per XBRL OIM), offset 0 renders as Z, other
+    // offsets render as ±hh:mm.
+    let shift = if tz == INTERVAL_NO_ZONE { 0 } else { tz as i64 * 60 };
+    let ndt = DateTime::from_timestamp(seconds + shift, nanos)
         .map(|dt| dt.naive_utc())
         .unwrap_or_else(|| {
             NaiveDate::from_ymd_opt(1970, 1, 1)
@@ -1127,11 +1158,19 @@ fn interval_component_to_iso(seconds: i64, nanos: u32) -> String {
                 .and_hms_opt(0, 0, 0)
                 .unwrap()
         });
-    if nanos == 0 {
-        ndt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    let base = if nanos == 0 {
+        ndt.format("%Y-%m-%dT%H:%M:%S").to_string()
     } else {
-        ndt.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string()
-    }
+        ndt.format("%Y-%m-%dT%H:%M:%S%.f").to_string()
+    };
+    let suffix = if tz == INTERVAL_NO_ZONE {
+        String::new()
+    } else if tz == 0 {
+        "Z".to_string()
+    } else {
+        format!("{}{:02}:{:02}", if tz < 0 { "-" } else { "+" }, tz.unsigned_abs() / 60, tz.unsigned_abs() % 60)
+    };
+    format!("{base}{suffix}")
 }
 
 fn interval_duration_to_iso(duration: &Duration) -> String {
@@ -1149,16 +1188,16 @@ impl FromLexical<DateTimeInterval> for String {
         let dur_str = interval_duration_to_iso(&iv.duration);
         match iv.flag {
             INTERVAL_FLAG_START_DURATION => {
-                let start = interval_component_to_iso(iv.start_seconds, iv.start_nanos);
+                let start = interval_component_to_iso(iv.start_seconds, iv.start_nanos, iv.start_tz);
                 format!("{start}/{dur_str}")
             }
             INTERVAL_FLAG_DURATION_END => {
-                let end = interval_component_to_iso(iv.end_seconds, iv.end_nanos);
+                let end = interval_component_to_iso(iv.end_seconds, iv.end_nanos, iv.end_tz);
                 format!("{dur_str}/{end}")
             }
             _ => {
-                let start = interval_component_to_iso(iv.start_seconds, iv.start_nanos);
-                let end = interval_component_to_iso(iv.end_seconds, iv.end_nanos);
+                let start = interval_component_to_iso(iv.start_seconds, iv.start_nanos, iv.start_tz);
+                let end = interval_component_to_iso(iv.end_seconds, iv.end_nanos, iv.end_tz);
                 format!("{start}/{end}")
             }
         }
@@ -1314,7 +1353,31 @@ mod tests {
             end_type,
             flag,
             duration,
+            start_tz: 0,
+            end_tz: 0,
         }
+    }
+
+    #[test]
+    fn date_time_interval_encoding_is_52_bytes() {
+        let iv = make_interval(
+            1735689600,
+            0,
+            1743465600,
+            0,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_COMPONENT_DATETIME,
+            INTERVAL_FLAG_EXPLICIT,
+            make_duration(1, 0, 0, 90, 0, 0, 0.0),
+        );
+        assert_eq!(iv.to_lexical().len(), INTERVAL_ENCODED_WIDTH);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid DateTimeInterval encoding width")]
+    fn date_time_interval_rejects_legacy_width() {
+        // The pre-timezone encoding was 48 bytes — now a hard error.
+        DateTimeInterval::from_lexical(&[0u8; 48][..]);
     }
 
     #[test]
@@ -1801,7 +1864,7 @@ mod tests {
     }
 
     #[test]
-    fn date_time_interval_encoding_is_48_bytes() {
+    fn date_time_interval_encoding_is_52_bytes_total() {
         let iv = make_interval(
             1735689600,
             0,
@@ -1813,7 +1876,7 @@ mod tests {
             make_duration(1, 0, 3, 0, 0, 0, 0.0),
         );
         let bytes = iv.to_lexical();
-        // 8(i64) + 4(u32) + 8(i64) + 4(u32) + 1 + 1 + 1 + duration(1+8+1+1+1+1+8 = 21) = 48
-        assert_eq!(48, bytes.len());
+        // 8(i64) + 4(u32) + 8(i64) + 4(u32) + 1 + 1 + 1 + duration(1+8+1+1+1+1+8 = 21) + 2(start_tz) + 2(end_tz) = 52
+        assert_eq!(52, bytes.len());
     }
 }

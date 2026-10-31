@@ -1094,7 +1094,7 @@ impl TdbDataType for DateTimeInterval {
 
 impl ToLexical<DateTimeInterval> for DateTimeInterval {
     fn to_lexical(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(48);
+        let mut buf = BytesMut::with_capacity(INTERVAL_ENCODED_WIDTH);
         // Sorting prefix: start timestamp (12 bytes) + end timestamp (12 bytes)
         buf.extend_from_slice(&self.start_seconds.to_lexical());
         buf.put_u32(self.start_nanos);

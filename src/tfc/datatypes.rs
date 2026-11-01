@@ -847,6 +847,29 @@ impl TdbDataType for Duration {
     }
 }
 
+impl Duration {
+    /// Canonical zero: sign 1 keeps the term representation a valid
+    /// `xsd:duration` (is_duration requires sign in {1,-1}).
+    pub const ZERO: Duration = Duration {
+        sign: 1,
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0.0,
+    };
+
+    pub fn is_zero(&self) -> bool {
+        self.year == 0
+            && self.month == 0
+            && self.day == 0
+            && self.hour == 0
+            && self.minute == 0
+            && self.second == 0.0
+    }
+}
+
 impl ToLexical<Duration> for Duration {
     fn to_lexical(&self) -> Bytes {
         let sign = self.sign.to_lexical();
@@ -1044,9 +1067,26 @@ impl TdbDataType for HexBinary {
 }
 
 /// Component type tag for DateTimeInterval endpoints.
-/// 0 = xsd:date, 1 = xsd:dateTime
+/// 0 = xsd:date, 1 = xsd:dateTime, 2 = open (`..`), 3 = unknown (empty).
 pub const INTERVAL_COMPONENT_DATE: u8 = 0;
 pub const INTERVAL_COMPONENT_DATETIME: u8 = 1;
+pub const INTERVAL_COMPONENT_OPEN: u8 = 2;
+pub const INTERVAL_COMPONENT_UNKNOWN: u8 = 3;
+
+/// Sentinel instants for non-finite endpoints (ISO 8601-2 `..` and empty).
+/// Real instants are bounded at ±262143 years, so the sentinels can never
+/// collide with parseable data. Open endpoints sit at the extreme they
+/// represent — −∞ sorts before everything, +∞ after — while unknown
+/// endpoints sit on the far side from their open counterpart so a single
+/// range cut excludes them from instant comparisons.
+pub const INTERVAL_NEG_INF: i64 = i64::MIN;
+pub const INTERVAL_POS_INF: i64 = i64::MAX;
+/// Unknown start sorts at the top of start order: `start_le`/`lt`/`eq`
+/// exclude it by construction, `start_ge`/`gt` cap at the unknown block.
+pub const INTERVAL_UNKNOWN_START: i64 = i64::MAX;
+/// Unknown end sorts at the bottom of end order: `end_ge`/`gt`/`eq`
+/// exclude it by construction, `end_le`/`lt` cut above the unknown rank.
+pub const INTERVAL_UNKNOWN_END: i64 = i64::MIN;
 
 /// Flag values for DateTimeInterval original input form.
 /// 0 = explicit (user gave start/end), 1 = start+duration, 2 = duration+end
@@ -1131,6 +1171,14 @@ impl FromLexical<DateTimeInterval> for DateTimeInterval {
         ) = decode_interval_prefix(&mut b);
         let start_tz = b.get_i16();
         let end_tz = b.get_i16();
+        validate_interval_endpoint(start_seconds, start_nanos, start_type, start_tz, true);
+        validate_interval_endpoint(end_seconds, end_nanos, end_type, end_tz, false);
+        if start_type >= INTERVAL_COMPONENT_OPEN || end_type >= INTERVAL_COMPONENT_OPEN {
+            assert!(
+                flag == INTERVAL_FLAG_EXPLICIT && duration.is_zero(),
+                "non-finite interval endpoint must be explicit form with zero duration"
+            );
+        }
         DateTimeInterval {
             start_seconds,
             start_nanos,
@@ -1143,6 +1191,48 @@ impl FromLexical<DateTimeInterval> for DateTimeInterval {
             start_tz,
             end_tz,
         }
+    }
+}
+
+/// Enforce the sentinel ⟺ component-type invariant and the canonical form of
+/// non-finite endpoints: open and unknown endpoints carry no nanos, no zone
+/// and no duration, and a finite component can never sit on a sentinel
+/// instant. Violations are corrupt data, not unusual values.
+fn validate_interval_endpoint(secs: i64, nanos: u32, ty: u8, tz: i16, is_start: bool) {
+    match ty {
+        INTERVAL_COMPONENT_DATE | INTERVAL_COMPONENT_DATETIME => assert!(
+            secs != INTERVAL_NEG_INF && secs != INTERVAL_POS_INF,
+            "finite interval endpoint on sentinel instant {secs}"
+        ),
+        INTERVAL_COMPONENT_OPEN => assert_eq!(
+            secs,
+            if is_start {
+                INTERVAL_NEG_INF
+            } else {
+                INTERVAL_POS_INF
+            },
+            "open interval endpoint with non-sentinel instant {secs}"
+        ),
+        INTERVAL_COMPONENT_UNKNOWN => assert_eq!(
+            secs,
+            if is_start {
+                INTERVAL_POS_INF
+            } else {
+                INTERVAL_NEG_INF
+            },
+            "unknown interval endpoint with non-sentinel instant {secs}"
+        ),
+        _ => panic!("unknown interval component type {ty}"),
+    }
+    if ty >= INTERVAL_COMPONENT_OPEN {
+        assert_eq!(
+            nanos, 0,
+            "non-canonical nanos {nanos} on non-finite interval endpoint"
+        );
+        assert_eq!(
+            tz, INTERVAL_NO_ZONE,
+            "non-canonical zone {tz} on non-finite interval endpoint"
+        );
     }
 }
 
@@ -1171,6 +1261,21 @@ fn decode_interval_prefix<B: Buf>(b: &mut B) -> (i64, u32, i64, u32, u8, u8, u8,
 pub const INTERVAL_LEGACY_ENCODED_WIDTH: usize = 48;
 
 impl DateTimeInterval {
+    /// ISO 8601-2 `..`: unbounded past on a start, unbounded future on an end.
+    pub fn is_start_open(&self) -> bool {
+        self.start_type == INTERVAL_COMPONENT_OPEN
+    }
+    pub fn is_end_open(&self) -> bool {
+        self.end_type == INTERVAL_COMPONENT_OPEN
+    }
+    /// ISO 8601-2 empty endpoint: an endpoint exists but is unspecified.
+    pub fn is_start_unknown(&self) -> bool {
+        self.start_type == INTERVAL_COMPONENT_UNKNOWN
+    }
+    pub fn is_end_unknown(&self) -> bool {
+        self.end_type == INTERVAL_COMPONENT_UNKNOWN
+    }
+
     /// Decode a legacy 48-byte interval entry (pre-timezone encoding).
     /// Legacy entries were normalised to UTC and always rendered `Z`, so
     /// both zone fields are the zero offset.
@@ -1206,7 +1311,13 @@ impl DateTimeInterval {
     }
 }
 
-fn interval_component_to_iso(seconds: i64, nanos: u32, tz: i16) -> String {
+fn interval_component_to_iso(seconds: i64, nanos: u32, tz: i16, ty: u8) -> String {
+    if ty == INTERVAL_COMPONENT_OPEN {
+        return "..".to_string();
+    }
+    if ty == INTERVAL_COMPONENT_UNKNOWN {
+        return String::new();
+    }
     // Render in the supplied zone: the instant is UTC, so the local wall
     // clock is utc + tz minutes. INTERVAL_NO_ZONE renders without a
     // designator (local time per XBRL OIM), offset 0 renders as Z, other
@@ -1259,18 +1370,28 @@ impl FromLexical<DateTimeInterval> for String {
         let dur_str = interval_duration_to_iso(&iv.duration);
         match iv.flag {
             INTERVAL_FLAG_START_DURATION => {
-                let start =
-                    interval_component_to_iso(iv.start_seconds, iv.start_nanos, iv.start_tz);
+                let start = interval_component_to_iso(
+                    iv.start_seconds,
+                    iv.start_nanos,
+                    iv.start_tz,
+                    iv.start_type,
+                );
                 format!("{start}/{dur_str}")
             }
             INTERVAL_FLAG_DURATION_END => {
-                let end = interval_component_to_iso(iv.end_seconds, iv.end_nanos, iv.end_tz);
+                let end =
+                    interval_component_to_iso(iv.end_seconds, iv.end_nanos, iv.end_tz, iv.end_type);
                 format!("{dur_str}/{end}")
             }
             _ => {
-                let start =
-                    interval_component_to_iso(iv.start_seconds, iv.start_nanos, iv.start_tz);
-                let end = interval_component_to_iso(iv.end_seconds, iv.end_nanos, iv.end_tz);
+                let start = interval_component_to_iso(
+                    iv.start_seconds,
+                    iv.start_nanos,
+                    iv.start_tz,
+                    iv.start_type,
+                );
+                let end =
+                    interval_component_to_iso(iv.end_seconds, iv.end_nanos, iv.end_tz, iv.end_type);
                 format!("{start}/{end}")
             }
         }

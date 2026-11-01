@@ -15,8 +15,27 @@ The encoding therefore grows from 48 to **52 bytes**:
 - Bytes 0–47 unchanged: 24-byte sort prefix (`start_seconds`, `start_nanos`, `end_seconds`, `end_nanos`), then `start_type`, `end_type`, `flag`, and the 21-byte `Duration`.
 - Bytes 48–51 (new): `start_tz: i16 BE` and `end_tz: i16` — the supplied UTC offset in minutes. The sentinel `INTERVAL_NO_ZONE = i16::MIN` marks a zone-less endpoint.
 - Zone semantics: the stored instant remains UTC (comparison and sorting are unaffected — the sort prefix is untouched); the offset is purely lexical metadata. For `start/duration` and `duration/end` forms, the computed endpoint inherits the supplied endpoint's offset. Date-only components keep the UTC convention and carry offset `0`.
+- Canonicalisation caveat: the offset *value* round-trips, not the exact designator spelling — `+00:00` and `-00:00` both render as `Z` (the OIM canonical form), matching xsd:dateTime canonicalisation.
 
-Compatibility: **there is no legacy 48-byte support.** `from_lexical` accepts exactly 52 bytes and fails hard with a recognisable message (`invalid DateTimeInterval encoding width`) on any other width. No rewriter is planned — interval storage predates production data; if a real store turns out to hold 48-byte entries, a rewriter that re-encodes the typed dictionary becomes necessary at that point.
+Compatibility: `from_lexical` accepts exactly 52 bytes and fails hard with a recognisable message (`invalid DateTimeInterval encoding width`) on any other width. Stored 48-byte entries are upgraded once at layer-open by `TypedDict::upgrade_legacy_intervals` — decoded as the legacy layout and re-encoded with zero zone offsets, matching how they always rendered. Anything else is still a hard error; no rewriter or persisted migration exists.
+
+## Encoding extension: ISO 8601-2 open and unknown endpoints
+
+ISO 8601-2:2019 interval endpoints are supported in the same 52-byte layout — no encoding growth. The endpoint type byte (`start_type`/`end_type`, previously `0 = date`, `1 = dateTime`) gains two kinds:
+
+| Kind | Lexical | Type byte | Sentinel `seconds` | Canonical fields |
+|---|---|---|---|---|
+| `INTERVAL_COMPONENT_OPEN = 2` | `..` | 2 | start `i64::MIN` (`INTERVAL_NEG_INF`), end `i64::MAX` (`INTERVAL_POS_INF`) | nanos 0, tz `NO_ZONE`, duration `Duration::ZERO`, flag `EXPLICIT` |
+| `INTERVAL_COMPONENT_UNKNOWN = 3` | (empty) | 3 | start `i64::MAX` (`INTERVAL_UNKNOWN_START`), end `i64::MIN` (`INTERVAL_UNKNOWN_END`) | same |
+
+Sentinel placement is asymmetric on purpose. Open endpoints are real bounds — they sit at the extreme they represent, so `-inf` sorts first and `+inf` last and every instant-algebra query behaves correctly for free: `start_le` includes open starts, `end_ge` includes open ends, and `../..` satisfies point-containment at any instant. Unknown endpoints have NULL semantics — they never satisfy an instant comparison — so each is parked at the one edge that needs exactly **one cut**:
+
+- Unknown **start** at `i64::MAX`: `start_le`/`lt`/`eq` are clean by ordering (top never satisfies `<=`); `start_ge`/`gt` cap their range at the first unknown-block id.
+- Unknown **end** at `i64::MIN` (rank 0): `end_ge`/`gt`/`eq` are clean by ordering; `end_le`/`lt` raise the lower bound to the first rank above the sentinel.
+
+The sentinels remain lexically addressable: `start_eq(INTERVAL_UNKNOWN_START, 0)` returns exactly the unknown-start ids, `end_eq(INTERVAL_UNKNOWN_END, 0)` the unknown-end set. Unknown endpoints are never semantically equal — not even to each other.
+
+Invariants enforced in `from_lexical`/`to_lexical`: sentinel seconds require a non-finite type byte and vice versa (`finite interval endpoint on sentinel`/`open interval endpoint with non-sentinel`), unknown type values fail hard, duration forms (`start/duration`, `duration/end`, `start/end/duration`) carrying a non-finite endpoint are rejected by `parse_iso_interval`, and `/` (both unknown) is legal. Compatibility caveat: stores written with type bytes `2`/`3` render as garbage instants under pre-support readers — unknown *values* in known files, unlike the tolerated unknown *files* case.
 
 ## xdd:dateRange
 
@@ -38,7 +57,7 @@ The tree shares the same position order as the typed dictionary, so position `i`
 
 ## Space
 
-- Current `DateTimeInterval` storage: ~48 bytes per interval.
+- Current `DateTimeInterval` storage: ~52 bytes per interval.
 - One dense-rank end wavelet tree: roughly **2.5–5 bytes per interval** plus one small rank table.
 - A full 96-bit alphabet would be ~12 bytes per interval and is not recommended.
 
@@ -114,15 +133,20 @@ The way forward is clear because the underlying wavelet-tree infrastructure is a
 | Predicate index wavelet tree | `terminusdb-store/src/layer/builder.rs` | Builds the predicate wavelet tree during `build_indexes`. |
 | Layer filenames | `terminusdb-store/src/storage/consts.rs` | Registry of all layer files, including the existing wavelet-tree names. |
 
-### Missing pieces
+### Implementation status
 
-1. **Dictionary boundary probes** — Craft 48-byte search keys (`start=P, end=MIN` or `end=MAX`, zeroed metadata) and call `id_slice` on the `DateTimeInterval` type segment; `IdLookupResult::Closest` yields the boundary position. Wrap in helpers returning `Range<u64>` for `start <=`, `start >`, and `start ==` probes.
-2. **Wavelet tree range/threshold queries** — Add operations that query a position subrange for values `<=`, `>=`, `==`, or within a value range. The current `WaveletTree` only supports whole-tree `lookup` and `decode`. Position-restricted queries are what let a start-probe range constrain the end-tree search.
-3. **Dense-rank 96-bit adapter** — Collect distinct end timestamps, sort them, assign compact `u64` ranks, and persist the rank table.
-4. **Interval index builder** — Extract `DateTimeInterval` entries from the typed dictionary, map their end timestamps to ranks, and build one wavelet tree per layer.
-5. **Layer file registration** — Add new filenames to `consts.rs`, load them in `InternalLayer`, and include them in pack/import/export.
-6. **Rust accessor API** — `Range<u64>` for start probes, streaming iterators for threshold and intersection queries.
-7. **Prolog FFI and Allen algebra** — Thin predicates that expose the Rust primitives to Prolog.
+Implemented in `tdb-succinct` (branch `xbrl-json-interval-timezone`):
+
+- **Dictionary boundary probes** — `TypedDict::interval_ids_start_{le,lt,gt,ge,eq}` in `src/tfc/interval.rs` return half-open global id `Range<u64>`s. They craft 52-byte search keys (`start=P` plus a minimum or maximum end/metadata tail) and resolve them through `id_slice` on the `DateTimeInterval` segment via `IdLookupResult::Closest`.
+- **Position-restricted wavelet queries** — `WaveletTree::positions_in_range` plus `positions_le`/`positions_ge`/`positions_eq` in `src/wavelettree.rs` return sorted positions inside a position window whose values fall in a value range. Bound-search strategy is chosen by window width: narrow value windows probe each candidate value via `lookup` (selective queries stay sub-100µs at 100k scale); wide windows enumerate distinct values via a decode pass. Measured: a ~60-match 1-hour end-date window answers in ~64µs vs ~21.6ms for a decode-and-compare scan; a broad ~83%-selectivity threshold is slower through the index than scanning (result enumeration dominates), so callers should pick the path per expected selectivity.
+- **Dense-rank end index** — `IntervalEndIndex` in `src/tfc/interval.rs`: a stride-2 `LogArray` of sorted distinct `(secs, nanos)` end keys plus a `WaveletTree` of per-position ranks. `end_lower_bound`/`end_upper_bound` binary-search the rank table; `positions_end_{le,lt,gt,ge,eq,range}` combine them. `build_interval_end_index` writes the four files from a `TypedDict`; `IntervalEndIndex::from_parts` loads them, deriving the tree width from the rank-table length.
+
+Still missing:
+
+1. **Layer file registration** — Add new filenames to `consts.rs`, load them in `InternalLayer`, and include them in pack/import/export.
+2. **Upgrade-on-read for old layers** — `TypedDict::upgrade_legacy_intervals` converts legacy 48-byte entries to 52 bytes in memory (zone fields get offset 0: legacy data always rendered `Z`). Run it once when a layer opens, then build the end index in memory over the upgraded segment. This replaces a scan fallback: no width dispatch on the query path, and old layers get the same index behaviour as new ones.
+3. **Rust accessor API** — Wire the probes and index into layer-level entry points returning ids, and intersect start ranges with position-restricted end results.
+4. **Prolog FFI and Allen algebra** — Thin predicates that expose the Rust primitives to Prolog.
 
 ### Where and when to build the index
 
@@ -140,7 +164,7 @@ Following the existing layer-file convention:
 - `interval_end_wavelet_tree_bits.bitarray`
 - `interval_end_wavelet_tree_bit_index_blocks.logarray`
 - `interval_end_wavelet_tree_bit_index_sblocks.logarray`
-- `interval_end_rank_table.bin`
+- `interval_end_rank_table.logarray` — stride-2 `(secs, nanos)` pairs, sorted distinct
 
 ### Data flow at layer build time
 
@@ -194,9 +218,14 @@ Layers are immutable, so existing layers never gain the index. Only new commits 
 
 To index existing history without waiting for organic rollups, an operator can force a rollup (squash) of the branch. Export/import also rebuilds all layers, but is heavier.
 
-### Fallback cost on unindexed layers
+### Upgrade-on-read cost for old layers
 
-The scan is bounded by `TypedDict::type_segment`: only the contiguous `DateTimeInterval` segment of the value dictionary is read, as fixed-width records in ascending id order. Layers without interval values cost a single segment lookup. The cost is therefore O(k) per query per unindexed layer, where k is the number of interval values in the layer — versus O(log m) rank operations on the wavelet trees. That is negligible for point lookups on interval-poor data, but compounds for interval-vs-interval Allen relations issued per candidate, and for deep layer stacks where every unindexed layer pays it. Interval-heavy datasets — the ones that benefit most from the index — are also the ones where the fallback is slowest, so a forced rollup is worth offering as an explicit migration step rather than relying on organic rollups alone.
+Layers written before this index exist in two respects: they may hold 48-byte interval entries, and they always lack the index files. Both are repaired once at layer-open rather than per query:
+
+- `TypedDict::upgrade_legacy_intervals` scans the interval segment once (O(k) length checks); if any entry is 48 bytes it rebuilds the dictionary in memory with every entry re-encoded at 52 bytes. Legacy entries get zero zone offsets — they were stored UTC-normalised and always rendered `Z`, so the upgrade is lossless. A 52-byte dictionary costs only the scan and is cloned through.
+- The end index is then built in memory from the upgraded segment — the same `build_interval_end_index` output that a new layer would read from files. `map_all_if_exists` simply finds nothing to load.
+
+Old layers therefore pay one linear pass and one index build at open, then every query takes the indexed path — there is no residual runtime penalty and no per-entry width dispatch. Interval-heavy old layers see a real open-time cost once per process instead of degraded queries forever.
 
 ### Archive backend constraint
 

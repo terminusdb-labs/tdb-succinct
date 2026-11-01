@@ -10,9 +10,10 @@ use super::block::IdLookupResult;
 use super::block::SizedDictEntry;
 use super::datatypes::{
     Datatype, DateTimeInterval, Duration, FromLexical, ToLexical, INTERVAL_COMPONENT_DATE,
-    INTERVAL_COMPONENT_DATETIME, INTERVAL_ENCODED_WIDTH, INTERVAL_FLAG_DURATION_END,
-    INTERVAL_FLAG_EXPLICIT, INTERVAL_FLAG_START_DURATION, INTERVAL_LEGACY_ENCODED_WIDTH,
-    INTERVAL_NO_ZONE,
+    INTERVAL_COMPONENT_DATETIME, INTERVAL_COMPONENT_OPEN, INTERVAL_COMPONENT_UNKNOWN,
+    INTERVAL_ENCODED_WIDTH, INTERVAL_FLAG_DURATION_END, INTERVAL_FLAG_EXPLICIT,
+    INTERVAL_FLAG_START_DURATION, INTERVAL_LEGACY_ENCODED_WIDTH, INTERVAL_NEG_INF,
+    INTERVAL_NO_ZONE, INTERVAL_POS_INF, INTERVAL_UNKNOWN_END, INTERVAL_UNKNOWN_START,
 };
 use super::typed::{TypedDict, TypedDictBufBuilder, TypedDictEntry};
 use crate::bitindex::BitIndex;
@@ -36,6 +37,57 @@ pub enum IntervalParseError {
     TwoDurations(String),
     #[error("interval has no date/datetime component: `{0}`")]
     NoDates(String),
+    #[error("duration combined with an open or unknown endpoint: `{0}`")]
+    UnboundedWithDuration(String),
+}
+
+/// A non-finite interval endpoint per ISO 8601-2: open (`..`) or unknown
+/// (empty).
+#[derive(Clone, Copy)]
+pub(crate) enum UnboundedEndpoint {
+    Open,
+    Unknown,
+}
+
+impl UnboundedEndpoint {
+    pub(crate) fn from_str(s: &str) -> Option<Self> {
+        match s {
+            ".." => Some(Self::Open),
+            "" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    /// Sentinel tuple `(seconds, nanos, component_type, tz)` for open and
+    /// unknown endpoints: −∞/+∞ for open, far-side sentinels for unknown.
+    fn sentinel(&self, is_end: bool) -> (i64, u32, u8, i16) {
+        match (self, is_end) {
+            (Self::Open, false) => (
+                INTERVAL_NEG_INF,
+                0,
+                INTERVAL_COMPONENT_OPEN,
+                INTERVAL_NO_ZONE,
+            ),
+            (Self::Open, true) => (
+                INTERVAL_POS_INF,
+                0,
+                INTERVAL_COMPONENT_OPEN,
+                INTERVAL_NO_ZONE,
+            ),
+            (Self::Unknown, false) => (
+                INTERVAL_UNKNOWN_START,
+                0,
+                INTERVAL_COMPONENT_UNKNOWN,
+                INTERVAL_NO_ZONE,
+            ),
+            (Self::Unknown, true) => (
+                INTERVAL_UNKNOWN_END,
+                0,
+                INTERVAL_COMPONENT_UNKNOWN,
+                INTERVAL_NO_ZONE,
+            ),
+        }
+    }
 }
 
 /// Parse an ISO 8601 interval string into a `DateTimeInterval`.
@@ -76,6 +128,9 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
 
     if left_is_duration {
         // duration/end — the computed start inherits the end's supplied zone
+        if UnboundedEndpoint::from_str(right).is_some() {
+            return Err(IntervalParseError::UnboundedWithDuration(s.to_string()));
+        }
         let duration = parse_iso_duration(left)?;
         let (end_seconds, end_nanos, end_type, end_tz) = parse_date_or_datetime(right, true)?;
         let (start_seconds, start_nanos) =
@@ -95,6 +150,9 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
         })
     } else if right_is_duration {
         // start/duration — the computed end inherits the start's supplied zone
+        if UnboundedEndpoint::from_str(left).is_some() {
+            return Err(IntervalParseError::UnboundedWithDuration(s.to_string()));
+        }
         let (start_seconds, start_nanos, start_type, start_tz) =
             parse_date_or_datetime(left, false)?;
         let duration = parse_iso_duration(right)?;
@@ -114,12 +172,24 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
             end_tz: start_tz,
         })
     } else {
-        // start/end (explicit)
+        // start/end (explicit) — endpoints may be finite, open (`..`) or
+        // unknown (empty) per ISO 8601-2; non-finite endpoints carry a
+        // canonical zero duration.
         let (start_seconds, start_nanos, start_type, start_tz) =
-            parse_date_or_datetime(left, false)?;
-        let (end_seconds, end_nanos, end_type, end_tz) = parse_date_or_datetime(right, true)?;
-        let duration =
-            compute_duration_from_endpoints(start_seconds, start_nanos, end_seconds, end_nanos);
+            match UnboundedEndpoint::from_str(left) {
+                Some(ep) => ep.sentinel(false),
+                None => parse_date_or_datetime(left, false)?,
+            };
+        let (end_seconds, end_nanos, end_type, end_tz) = match UnboundedEndpoint::from_str(right) {
+            Some(ep) => ep.sentinel(true),
+            None => parse_date_or_datetime(right, true)?,
+        };
+        let duration = if start_type < INTERVAL_COMPONENT_OPEN && end_type < INTERVAL_COMPONENT_OPEN
+        {
+            compute_duration_from_endpoints(start_seconds, start_nanos, end_seconds, end_nanos)
+        } else {
+            Duration::ZERO
+        };
         Ok(DateTimeInterval {
             start_seconds,
             start_nanos,
@@ -142,7 +212,7 @@ pub fn parse_iso_interval(s: &str) -> Result<DateTimeInterval, IntervalParseErro
 /// When `is_end` is true and the component is a date, the date is bumped to the
 /// next calendar day, matching the half-open interval convention for unqualified
 /// ISO 8601 end dates.
-fn parse_date_or_datetime(
+pub(crate) fn parse_date_or_datetime(
     s: &str,
     is_end: bool,
 ) -> Result<(i64, u32, u8, i16), IntervalParseError> {
@@ -180,11 +250,13 @@ fn parse_date_or_datetime(
 }
 
 /// Designators in the ISO 8601 order used for duration parsing.
-/// The order is: Y < M < D < H < Minute < S.
+/// The order is: Y < M < W < D < H < Minute < S.
+/// `W` may not be combined with `Y`/`M`/`D` (enforced at parse).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DurationDesignator {
     Year,
     Month,
+    Week,
     Day,
     Hour,
     Minute,
@@ -206,7 +278,7 @@ fn validate_designator_order(
 
 /// Parse an ISO 8601 duration string like `P3M`, `P1Y2M3DT4H5M6S`, `-P1D`.
 /// Designators must appear in the order Y, M, D, T, H, M, S and may not be repeated.
-fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError> {
+pub(crate) fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError> {
     let err = || IntervalParseError::InvalidDuration(s.to_string());
 
     let (sign, rest) = if let Some(stripped) = s.strip_prefix('-') {
@@ -230,8 +302,11 @@ fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError> {
     if !date_part.is_empty() {
         let mut num_buf = String::new();
         let mut last_designator: Option<DurationDesignator> = None;
+        let mut seen_week = false;
         for ch in date_part.chars() {
             match ch {
+                // ISO 8601: weeks may not be combined with Y/M/D
+                'Y' | 'M' | 'D' if seen_week => return Err(err()),
                 'Y' => {
                     let d = DurationDesignator::Year;
                     validate_designator_order(&last_designator, d).map_err(|_| err())?;
@@ -245,6 +320,19 @@ fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError> {
                     last_designator = Some(d);
                     month = num_buf.parse::<u8>().map_err(|_| err())?;
                     num_buf.clear();
+                }
+                'W' => {
+                    let d = DurationDesignator::Week;
+                    validate_designator_order(&last_designator, d).map_err(|_| err())?;
+                    if last_designator.is_some() {
+                        // W must be the only date designator
+                        return Err(err());
+                    }
+                    last_designator = Some(d);
+                    let weeks = num_buf.parse::<u8>().map_err(|_| err())?;
+                    day = weeks.checked_mul(7).ok_or_else(err)?;
+                    num_buf.clear();
+                    seen_week = true;
                 }
                 'D' => {
                     let d = DurationDesignator::Day;
@@ -317,7 +405,7 @@ fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError> {
 
 /// Compute an approximate duration from two endpoints.
 /// This produces a day-based duration (no month/year component).
-fn compute_duration_from_endpoints(
+pub(crate) fn compute_duration_from_endpoints(
     start_seconds: i64,
     start_nanos: u32,
     end_seconds: i64,
@@ -352,7 +440,7 @@ fn compute_duration_from_endpoints(
 
 /// Compute end timestamp from start + duration.
 /// For year/month durations, this uses chrono calendar arithmetic.
-fn compute_end_from_start_and_duration(
+pub(crate) fn compute_end_from_start_and_duration(
     duration: &Duration,
     start_seconds: i64,
     start_nanos: u32,
@@ -390,7 +478,7 @@ fn compute_end_from_start_and_duration(
 }
 
 /// Compute start timestamp from duration + end.
-fn compute_start_from_duration_and_end(
+pub(crate) fn compute_start_from_duration_and_end(
     duration: &Duration,
     end_seconds: i64,
     end_nanos: u32,
@@ -531,24 +619,38 @@ impl TypedDict {
         }
     }
 
-    /// Ids of entries with `start > (secs, nanos)`.
+    /// Global id of the first unknown-start entry (`start ==
+    /// INTERVAL_POS_INF`): the upper cap for `start_ge`/`start_gt` ranges so
+    /// unknown starts satisfy no instant comparison.
+    fn interval_unknown_start_bound(&self, seg: &Range<u64>) -> u64 {
+        match self.interval_probe(INTERVAL_UNKNOWN_START, 0, false) {
+            Some((k, found)) => (if found { k } else { k + 1 }).clamp(seg.start, seg.end),
+            None => seg.end,
+        }
+    }
+
+    /// Ids of entries with `start > (secs, nanos)`. Unknown starts are
+    /// excluded: an unspecified start satisfies no instant comparison.
     pub fn interval_ids_start_gt(&self, secs: i64, nanos: u32) -> Range<u64> {
         let Some(seg) = self.interval_segment() else {
             return 0..0;
         };
+        let cap = self.interval_unknown_start_bound(&seg);
         match self.interval_probe(secs, nanos, true) {
-            Some((k, _)) => (k + 1).clamp(seg.start, seg.end)..seg.end,
+            Some((k, _)) => (k + 1).clamp(seg.start, cap)..cap,
             None => 0..0,
         }
     }
 
-    /// Ids of entries with `start >= (secs, nanos)`.
+    /// Ids of entries with `start >= (secs, nanos)`. Unknown starts are
+    /// excluded.
     pub fn interval_ids_start_ge(&self, secs: i64, nanos: u32) -> Range<u64> {
         let Some(seg) = self.interval_segment() else {
             return 0..0;
         };
+        let cap = self.interval_unknown_start_bound(&seg);
         match self.interval_probe(secs, nanos, false) {
-            Some((k, found)) => (if found { k } else { k + 1 }).clamp(seg.start, seg.end)..seg.end,
+            Some((k, found)) => (if found { k } else { k + 1 }).clamp(seg.start, cap)..cap,
             None => 0..0,
         }
     }
@@ -635,7 +737,7 @@ pub struct IntervalEndIndex {
 
 /// Wavelet alphabet width needed to encode `n` distinct end ranks.
 /// Minimum 1: width 0 would yield an empty tree of length 0.
-fn end_rank_width(n: usize) -> u8 {
+pub(crate) fn end_rank_width(n: usize) -> u8 {
     (u64::BITS - n.saturating_sub(1).leading_zeros()).max(1) as u8
 }
 
@@ -732,19 +834,32 @@ impl IntervalEndIndex {
         lo
     }
 
-    /// Segment positions in `pos` with `end <= (secs, nanos)`.
+    /// First rank above the unknown-end block (rank keys `(_, _)` >
+    /// `(INTERVAL_UNKNOWN_END, 0)`): NULL-semantics cut for the `le`/`lt`
+    /// family, whose ranges otherwise reach rank 0.
+    fn first_non_unknown_end_rank(&self) -> u64 {
+        self.end_lower_bound(INTERVAL_UNKNOWN_END + 1, 0)
+    }
+
+    /// Segment positions in `pos` with `end <= (secs, nanos)`. Unknown ends
+    /// are excluded: an unspecified end satisfies no instant comparison.
     pub fn positions_end_le(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
         match self.end_upper_bound(secs, nanos) {
             0 => Vec::new(),
-            hi => self.tree.positions_le(pos, hi - 1),
+            hi => self
+                .tree
+                .positions_in_range(pos, self.first_non_unknown_end_rank(), hi - 1),
         }
     }
 
-    /// Segment positions in `pos` with `end < (secs, nanos)`.
+    /// Segment positions in `pos` with `end < (secs, nanos)`. Unknown ends
+    /// are excluded.
     pub fn positions_end_lt(&self, pos: Range<u64>, secs: i64, nanos: u32) -> Vec<u64> {
         match self.end_lower_bound(secs, nanos) {
             0 => Vec::new(),
-            hi => self.tree.positions_le(pos, hi - 1),
+            hi => self
+                .tree
+                .positions_in_range(pos, self.first_non_unknown_end_rank(), hi - 1),
         }
     }
 
@@ -772,8 +887,11 @@ impl IntervalEndIndex {
     }
 
     /// Segment positions in `pos` with `end` in `[lo, hi]` inclusive.
+    /// Unknown ends are excluded.
     pub fn positions_end_range(&self, pos: Range<u64>, lo: (i64, u32), hi: (i64, u32)) -> Vec<u64> {
-        let r_lo = self.end_lower_bound(lo.0, lo.1);
+        let r_lo = self
+            .end_lower_bound(lo.0, lo.1)
+            .max(self.first_non_unknown_end_rank());
         let r_hi = self.end_upper_bound(hi.0, hi.1);
         if r_lo >= r_hi {
             Vec::new()
@@ -1471,5 +1589,200 @@ mod tests {
         // ISO 8601 requires Y, M, D order before T and H, M, S order after T.
         assert!(parse_iso_interval("2025-01-01/P1D1Y").is_err());
         assert!(parse_iso_interval("2025-01-01/PT1S1H").is_err());
+    }
+
+    // --- ISO 8601-2 open and unknown endpoints ---
+
+    #[test]
+    fn parse_open_end() {
+        let iv = parse_iso_interval("2024-01-01T00:00:00Z/..").unwrap();
+        assert!(iv.is_end_open());
+        assert!(!iv.is_start_open());
+        assert_eq!(iv.end_seconds, INTERVAL_POS_INF);
+        assert_eq!(iv.end_type, INTERVAL_COMPONENT_OPEN);
+        assert_eq!(iv.end_nanos, 0);
+        assert_eq!(iv.end_tz, INTERVAL_NO_ZONE);
+        assert_eq!(iv.flag, INTERVAL_FLAG_EXPLICIT);
+        assert!(iv.duration.is_zero());
+    }
+
+    #[test]
+    fn parse_open_start() {
+        let iv = parse_iso_interval("../2024-01-01T00:00:00Z").unwrap();
+        assert!(iv.is_start_open());
+        assert_eq!(iv.start_seconds, INTERVAL_NEG_INF);
+        assert_eq!(iv.start_type, INTERVAL_COMPONENT_OPEN);
+    }
+
+    #[test]
+    fn parse_forever() {
+        let iv = parse_iso_interval("../..").unwrap();
+        assert!(iv.is_start_open() && iv.is_end_open());
+    }
+
+    #[test]
+    fn parse_unknown_end() {
+        let iv = parse_iso_interval("2024-01-01T00:00:00Z/").unwrap();
+        assert!(iv.is_end_unknown());
+        assert_eq!(iv.end_seconds, INTERVAL_UNKNOWN_END);
+        assert_eq!(iv.end_type, INTERVAL_COMPONENT_UNKNOWN);
+    }
+
+    #[test]
+    fn parse_unknown_start() {
+        let iv = parse_iso_interval("/2024-01-01T00:00:00Z").unwrap();
+        assert!(iv.is_start_unknown());
+        assert_eq!(iv.start_seconds, INTERVAL_UNKNOWN_START);
+    }
+
+    #[test]
+    fn parse_both_unknown() {
+        let iv = parse_iso_interval("/").unwrap();
+        assert!(iv.is_start_unknown() && iv.is_end_unknown());
+    }
+
+    #[test]
+    fn duration_with_unbounded_endpoint_is_error() {
+        for s in ["P1Y/..", "P1Y/", "../P1Y", "/P1Y"] {
+            assert!(
+                matches!(
+                    parse_iso_interval(s),
+                    Err(IntervalParseError::UnboundedWithDuration(_))
+                ),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_and_unknown_round_trip() {
+        for s in [
+            "2024-01-01T00:00:00Z/..",
+            "../2024-01-01T00:00:00Z",
+            "../..",
+            "2024-01-01T00:00:00Z/",
+            "/2024-01-01T00:00:00Z",
+            "/",
+            "../",
+        ] {
+            let iv = parse_iso_interval(s).unwrap();
+            let round = <String as FromLexical<DateTimeInterval>>::from_lexical(iv.to_lexical());
+            assert_eq!(s, round, "round trip {s}");
+        }
+    }
+
+    fn raw_interval_bytes(
+        start_seconds: i64,
+        start_type: u8,
+        end_seconds: i64,
+        end_type: u8,
+    ) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&start_seconds.to_lexical());
+        buf.put_u32(0u32);
+        buf.extend_from_slice(&end_seconds.to_lexical());
+        buf.put_u32(0u32);
+        buf.put_u8(start_type);
+        buf.put_u8(end_type);
+        buf.put_u8(INTERVAL_FLAG_EXPLICIT);
+        buf.extend_from_slice(&Duration::ZERO.to_lexical());
+        buf.put_i16(INTERVAL_NO_ZONE);
+        buf.put_i16(INTERVAL_NO_ZONE);
+        buf.freeze()
+    }
+
+    #[test]
+    #[should_panic(expected = "finite interval endpoint on sentinel")]
+    fn finite_endpoint_on_sentinel_is_rejected() {
+        let bytes = raw_interval_bytes(
+            INTERVAL_NEG_INF,
+            INTERVAL_COMPONENT_DATE,
+            1700000000,
+            INTERVAL_COMPONENT_DATE,
+        );
+        DateTimeInterval::from_lexical(bytes);
+    }
+
+    #[test]
+    #[should_panic(expected = "open interval endpoint with non-sentinel")]
+    fn open_endpoint_without_sentinel_is_rejected() {
+        let bytes = raw_interval_bytes(
+            1700000000,
+            INTERVAL_COMPONENT_OPEN,
+            1700000000,
+            INTERVAL_COMPONENT_DATE,
+        );
+        DateTimeInterval::from_lexical(bytes);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown interval component type")]
+    fn unknown_component_type_is_rejected() {
+        let bytes = raw_interval_bytes(1700000000, 99, 1700000000, INTERVAL_COMPONENT_DATE);
+        DateTimeInterval::from_lexical(bytes);
+    }
+
+    fn iv_entry(s: &str) -> TypedDictEntry {
+        DateTimeInterval::make_entry(&parse_iso_interval(s).unwrap())
+    }
+
+    #[test]
+    fn start_probes_exclude_unknown_starts() {
+        // sort order: open start (-inf) < finite starts < unknown start (+inf)
+        let dict = build_dict(vec![
+            iv_entry("../2024-01-01T00:00:00Z"),
+            iv_entry("2024-01-01T00:00:10Z/2024-01-01T00:00:20Z"),
+            iv_entry("/2024-01-01T00:00:00Z"),
+        ]);
+        let seg = dict.interval_segment().unwrap();
+        let t10 = parse_iso_interval("2024-01-01T00:00:10Z/2024-01-01T00:00:20Z")
+            .unwrap()
+            .start_seconds;
+
+        // open start (-inf) and the finite start satisfy start <= t10; the
+        // unknown start does not participate
+        assert_eq!(seg.start..seg.start + 2, dict.interval_ids_start_le(t10, 0));
+        // only finite starts satisfy start >= a finite bound: the open start
+        // (-inf) is below it and the unknown start is cut above
+        assert_eq!(
+            seg.start + 1..seg.end - 1,
+            dict.interval_ids_start_ge(t10, 0)
+        );
+        assert_eq!(seg.start + 1..seg.end - 1, dict.interval_ids_start_gt(0, 0));
+        // start_le still covers the open start: -inf <= everything
+        assert_eq!(seg.start..seg.start + 2, dict.interval_ids_start_le(t10, 0));
+        // the unknown block is still reachable lexically via start_eq at the sentinel
+        assert_eq!(
+            seg.end - 1..seg.end,
+            dict.interval_ids_start_eq(INTERVAL_UNKNOWN_START, 0)
+        );
+    }
+
+    #[test]
+    fn end_index_excludes_unknown_ends() {
+        let dict = build_dict(vec![
+            iv_entry("../.."),                                     // open end
+            iv_entry("2024-01-01T00:00:10Z/2024-01-01T00:00:20Z"), // finite end
+            iv_entry("2024-01-01T00:00:30Z/"),                     // unknown end
+        ]);
+        let index = IntervalEndIndex::build(&dict);
+        let t20 = parse_iso_interval("2024-01-01T00:00:10Z/2024-01-01T00:00:20Z")
+            .unwrap()
+            .end_seconds;
+
+        // dict order: ../.. (start -inf) first, then by end? no — dict sorts
+        // by start first: ../.. (start MIN) id seg.start, finite id +1,
+        // unknown-start? no — unknown END sorts by its start (t30) → id +2.
+        // positions in the index are segment-relative: pos 0=../..,1=finite,2=x/
+        assert_eq!(vec![1], index.positions_end_le(0..3, t20, 0));
+        // end_ge includes +inf (forever) but not unknown
+        assert_eq!(vec![0, 1], index.positions_end_ge(0..3, t20, 0));
+        // unknown ends reachable lexically via end_eq at the sentinel
+        assert_eq!(
+            vec![2],
+            index.positions_end_eq(0..3, INTERVAL_UNKNOWN_END, 0)
+        );
+        // forever satisfies containment at any instant
+        assert_eq!(vec![0, 1], index.positions_end_ge(0..3, t20, 0));
     }
 }

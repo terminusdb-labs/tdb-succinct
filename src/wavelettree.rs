@@ -114,6 +114,11 @@ impl WaveletTree {
         self.num_layers as usize
     }
 
+    /// Decompose into the underlying bit index and layer count.
+    pub fn into_parts(self) -> (u8, BitIndex) {
+        (self.num_layers, self.bits)
+    }
+
     /// Decode the wavelet tree to the original u64 sequence. This returns an iterator.
     pub fn decode(&self) -> impl Iterator<Item = u64> {
         let owned = self.clone();
@@ -212,28 +217,37 @@ impl WaveletTree {
     /// Returns the positions in `pos` whose values lie in `[val_lo, val_hi]`,
     /// sorted ascending. Positions outside `0..self.len()` are clamped.
     ///
-    /// Enumerates the distinct values present, looks up each in-range value
-    /// and filters positions by the window: O(n + sigma_range log sigma).
-    /// shortcut: full-tree DFS pruning would skip the decode pass, but the
-    /// position-restricted child-window math is subtle; revisit if profiling
-    /// shows the decode scan dominates.
+    /// Two strategies: when the value window is narrower than the position
+    /// window, each candidate value is looked up directly
+    /// (O(width · log sigma + k log sigma), selective queries stay fast
+    /// regardless of n); otherwise the values present are discovered by a
+    /// decode pass over the sequence and each is looked up once
+    /// (O(n + sigma_range log sigma), better for broad ranges).
     pub fn positions_in_range(&self, pos: Range<u64>, val_lo: u64, val_hi: u64) -> Vec<u64> {
         let pos_hi = pos.end.min(self.len() as u64);
         if self.num_layers == 0 || pos.start >= pos_hi || val_lo > val_hi {
             return Vec::new();
         }
 
-        let mut values: Vec<u64> = self
-            .decode()
-            .filter(|v| *v >= val_lo && *v <= val_hi)
-            .collect();
-        values.sort_unstable();
-        values.dedup();
-
         let mut out = Vec::new();
-        for v in values {
-            if let Some(lookup) = self.lookup(v) {
-                out.extend(lookup.iter().filter(|p| *p >= pos.start && *p < pos_hi));
+        if val_hi - val_lo < pos_hi - pos.start {
+            // narrow value window: probe each candidate value
+            for v in val_lo..=val_hi {
+                if let Some(lookup) = self.lookup(v) {
+                    out.extend(lookup.iter().filter(|p| *p >= pos.start && *p < pos_hi));
+                }
+            }
+        } else {
+            let mut values: Vec<u64> = self
+                .decode()
+                .filter(|v| *v >= val_lo && *v <= val_hi)
+                .collect();
+            values.sort_unstable();
+            values.dedup();
+            for v in values {
+                if let Some(lookup) = self.lookup(v) {
+                    out.extend(lookup.iter().filter(|p| *p >= pos.start && *p < pos_hi));
+                }
             }
         }
         out.sort_unstable();

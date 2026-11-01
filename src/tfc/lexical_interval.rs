@@ -1849,7 +1849,7 @@ impl Bound {
                 },
                 Bound::Instant {
                     secs: sb,
-                    is_neg: nb,
+                    is_neg: _,
                     frac: fb,
                 },
             ) => Some(sa.cmp(sb).then_with(|| {

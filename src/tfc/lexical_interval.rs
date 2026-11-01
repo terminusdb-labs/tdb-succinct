@@ -164,6 +164,8 @@ pub enum LexicalIntervalError {
     MalformedEntry,
     #[error("finite endpoint `{0}` is not representable at nanos precision")]
     UnrepresentableEnd(String),
+    #[error("unknown interval relation: `{0}`")]
+    UnknownRelation(String),
 }
 
 // -- components ---------------------------------------------------------------
@@ -1744,6 +1746,174 @@ pub async fn build_interval_end_index_lexical<F: 'static + FileLoad + FileStore>
     .await
 }
 
+// ---- Allen interval relations (literal-level evaluator) ----
+
+/// The thirteen Allen interval relations; inverses evaluate as the
+/// corresponding base relation with swapped operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllenRelation {
+    Before,
+    Meets,
+    Overlaps,
+    Starts,
+    During,
+    Finishes,
+    Equals,
+    After,
+    MetBy,
+    OverlappedBy,
+    StartedBy,
+    Contains,
+    FinishedBy,
+}
+
+impl std::str::FromStr for AllenRelation {
+    type Err = LexicalIntervalError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use AllenRelation::*;
+        Ok(match s {
+            "before" => Before,
+            "meets" => Meets,
+            "overlaps" => Overlaps,
+            "starts" => Starts,
+            "during" => During,
+            "finishes" => Finishes,
+            "equals" => Equals,
+            "after" => After,
+            "met_by" => MetBy,
+            "overlapped_by" => OverlappedBy,
+            "started_by" => StartedBy,
+            "contains" => Contains,
+            "finished_by" => FinishedBy,
+            _ => return Err(LexicalIntervalError::UnknownRelation(s.to_string())),
+        })
+    }
+}
+
+/// Parse a literal as an interval; a bare instant literal coerces to the
+/// zero-duration point interval `[t, t)` so `dateTime` operands work under
+/// Allen relations.
+pub fn literal_as_interval(s: &str) -> Result<LexicalInterval, LexicalIntervalError> {
+    parse_lexical_interval(s).or_else(|_| parse_lexical_interval(&format!("{s}/{s}")))
+}
+
+/// Semantic ordering position of a component: `Bottom`/`Top` are the
+/// unbounded extremes, `Null` is any incommensurable special (unknown,
+/// unspecified) — comparisons against Null are false, never errors.
+#[derive(Debug)]
+enum Bound {
+    Instant {
+        secs: i64,
+        is_neg: bool,
+        frac: String,
+    },
+    Bottom,
+    Top,
+    Null,
+}
+
+impl Bound {
+    fn start(c: &Component) -> Self {
+        match c {
+            Component::Finite(f) => Bound::instant(f),
+            Component::Unbounded => Bound::Bottom,
+            _ => Bound::Null,
+        }
+    }
+    fn end(c: &Component) -> Self {
+        match c {
+            Component::Finite(f) => Bound::instant(f),
+            Component::Unbounded => Bound::Top,
+            _ => Bound::Null,
+        }
+    }
+    fn instant(f: &FiniteComponent) -> Self {
+        Bound::Instant {
+            secs: secs_nanos(f).0,
+            is_neg: f.is_neg,
+            frac: f.frac.clone().unwrap_or_default(),
+        }
+    }
+    fn cmp(a: &Self, b: &Self) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        match (a, b) {
+            (Bound::Null, _) | (_, Bound::Null) => None,
+            (Bound::Bottom, Bound::Bottom) | (Bound::Top, Bound::Top) => Some(Ordering::Equal),
+            (Bound::Bottom, _) | (_, Bound::Top) => Some(Ordering::Less),
+            (Bound::Top, _) | (_, Bound::Bottom) => Some(Ordering::Greater),
+            (
+                Bound::Instant {
+                    secs: sa,
+                    is_neg: na,
+                    frac: fa,
+                },
+                Bound::Instant {
+                    secs: sb,
+                    is_neg: nb,
+                    frac: fb,
+                },
+            ) => Some(sa.cmp(sb).then_with(|| {
+                // Negative fracs count down from the ceiling int, so their
+                // digits order *descending* with value.
+                let c = fa.as_str().cmp(fb.as_str());
+                if *na {
+                    c.reverse()
+                } else {
+                    c
+                }
+            })),
+        }
+    }
+    fn lt(a: &Self, b: &Self) -> bool {
+        Bound::cmp(a, b) == Some(std::cmp::Ordering::Less)
+    }
+    fn gt(a: &Self, b: &Self) -> bool {
+        Bound::cmp(a, b) == Some(std::cmp::Ordering::Greater)
+    }
+    fn eq(a: &Self, b: &Self) -> bool {
+        Bound::cmp(a, b) == Some(std::cmp::Ordering::Equal)
+    }
+    fn le(a: &Self, b: &Self) -> bool {
+        matches!(
+            Bound::cmp(a, b),
+            Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
+        )
+    }
+}
+
+/// Evaluate an Allen relation between two decoded intervals. Endpoints are
+/// half-open `[start, end)`; non-finite endpoints follow the ordering
+/// (`..` open = the true extreme) and unknown/unspecified endpoints make
+/// every comparison false (NULL semantics). The point sorting is `i1, t, i2`
+/// when i1 meets i2 at t: a point on the left of `during` is contained when
+/// `bs <= t < be`, so the seam point belongs to the interval it starts —
+/// exactly one of two consecutive intervals.
+pub fn interval_relation(a: &LexicalInterval, rel: AllenRelation, b: &LexicalInterval) -> bool {
+    use AllenRelation::*;
+    match rel {
+        After => return interval_relation(b, Before, a),
+        MetBy => return interval_relation(b, Meets, a),
+        OverlappedBy => return interval_relation(b, Overlaps, a),
+        StartedBy => return interval_relation(b, Starts, a),
+        Contains => return interval_relation(b, During, a),
+        FinishedBy => return interval_relation(b, Finishes, a),
+        _ => {}
+    }
+    let (as_, ae) = (Bound::start(&a.start), Bound::end(&a.end));
+    let (bs, be) = (Bound::start(&b.start), Bound::end(&b.end));
+    match rel {
+        Equals => Bound::eq(&as_, &bs) && Bound::eq(&ae, &be),
+        Before => Bound::lt(&ae, &bs),
+        Meets => Bound::eq(&ae, &bs),
+        Overlaps => Bound::lt(&as_, &bs) && Bound::lt(&bs, &ae) && Bound::lt(&ae, &be),
+        Starts => Bound::eq(&as_, &bs) && Bound::lt(&ae, &be),
+        Finishes => Bound::gt(&as_, &bs) && Bound::eq(&ae, &be),
+        During if Bound::eq(&as_, &ae) => Bound::le(&bs, &as_) && Bound::lt(&as_, &be),
+        During => Bound::lt(&bs, &as_) && Bound::lt(&ae, &be),
+        _ => unreachable!(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3068,5 +3238,115 @@ mod tests {
         // bound in the leap-aware domain: 2025-05-01 UTC
         let bound = posix_to_leap_aware_secs(1_746_057_600);
         assert_eq!(vec![0], idx.positions_end_le(0..3, bound, 0));
+    }
+
+    #[test]
+    fn allen_relations_constraint_table() {
+        use AllenRelation::*;
+        // explicit datetime ends (bare `date` ends are inclusive and bump a day)
+        let a = parse_lexical_interval("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z").unwrap();
+        let b = parse_lexical_interval("2025-04-01T00:00:00Z/2025-07-01T00:00:00Z").unwrap();
+        let c = parse_lexical_interval("2025-02-01T00:00:00Z/2025-03-01T00:00:00Z").unwrap();
+        let d = parse_lexical_interval("2025-03-01T00:00:00Z/2025-06-01T00:00:00Z").unwrap();
+        let a2 = parse_lexical_interval("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z").unwrap();
+        let tail = parse_lexical_interval("2025-03-01T00:00:00Z/2025-04-01T00:00:00Z").unwrap();
+        let head = parse_lexical_interval("2025-01-01T00:00:00Z/2025-02-01T00:00:00Z").unwrap();
+        assert!(interval_relation(&a, Meets, &b));
+        assert!(interval_relation(&b, MetBy, &a));
+        assert!(!interval_relation(&a, Before, &b)); // meets, not before
+        assert!(interval_relation(
+            &a,
+            Before,
+            &parse_lexical_interval("2025-04-02T00:00:00Z/2025-05-01T00:00:00Z").unwrap()
+        ));
+        assert!(interval_relation(&a, Overlaps, &d));
+        assert!(interval_relation(&d, OverlappedBy, &a));
+        assert!(interval_relation(&head, Starts, &a));
+        assert!(interval_relation(&a, StartedBy, &head));
+        assert!(interval_relation(&c, During, &a));
+        assert!(interval_relation(&a, Contains, &c));
+        assert!(interval_relation(&tail, Finishes, &a));
+        assert!(interval_relation(&a, FinishedBy, &tail));
+        assert!(interval_relation(&a, Equals, &a2));
+        assert!(!interval_relation(&a, Equals, &b));
+        // starts is not during: shared-start sub-interval fails strict during
+        assert!(!interval_relation(&head, During, &a));
+        // meets is not overlaps
+        assert!(!interval_relation(&a, Overlaps, &b));
+    }
+
+    #[test]
+    fn allen_relations_semantic_instant_equality() {
+        // Same instant, different spellings: meets across zone/precision.
+        let a = parse_lexical_interval("2025-01-01T00:00:00Z/2025-04-01T00:00:00.50Z").unwrap();
+        let b = parse_lexical_interval("2025-04-01T02:00:00.5+02:00/2025-07-01T00:00:00Z").unwrap();
+        assert!(interval_relation(&a, AllenRelation::Meets, &b));
+        assert!(!interval_relation(&a, AllenRelation::Before, &b));
+    }
+
+    #[test]
+    fn allen_relations_point_operands() {
+        use AllenRelation::*;
+        let a = parse_lexical_interval("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z").unwrap();
+        // a dateTime literal coerces to the point [t,t)
+        let p = literal_as_interval("2025-02-01T00:00:00Z").unwrap();
+        assert!(interval_relation(&p, During, &a));
+        assert!(interval_relation(&a, Contains, &p));
+        // a bare `date` literal coerces to the day interval [day, day+1), not a point
+        let day = literal_as_interval("2025-02-01").unwrap();
+        assert!(!Bound::eq(&Bound::start(&day.start), &Bound::end(&day.end)));
+        // the point sorting: i1, t, i2 — a point at a meeting boundary belongs
+        // to the interval it starts
+        let s = literal_as_interval("2025-01-01T00:00:00Z").unwrap();
+        assert!(interval_relation(&s, During, &a)); // t == a.start: member
+        let e = literal_as_interval("2025-04-01T00:00:00Z").unwrap();
+        assert!(!interval_relation(&e, During, &a)); // t == a.end: not a's
+        assert!(interval_relation(
+            &e,
+            During,
+            &parse_lexical_interval("2025-04-01T00:00:00Z/2025-07-01T00:00:00Z").unwrap()
+        ));
+        assert!(interval_relation(&e, MetBy, &a));
+        // points never overlap/start/finish; equal points are Equals
+        assert!(!interval_relation(&p, Overlaps, &a));
+        assert!(interval_relation(
+            &p,
+            Equals,
+            &literal_as_interval("2025-02-01T00:00:00Z").unwrap()
+        ));
+        assert!(interval_relation(
+            &literal_as_interval("2025-05-01T00:00:00Z").unwrap(),
+            Before,
+            &literal_as_interval("2025-06-01T00:00:00Z").unwrap()
+        ));
+        // an interval can't be during a point
+        assert!(!interval_relation(&a, During, &e));
+    }
+
+    #[test]
+    fn allen_relations_special_endpoints() {
+        use AllenRelation::*;
+        let a = parse_lexical_interval("2025-01-01T00:00:00Z/2025-04-01T00:00:00Z").unwrap();
+        // ../end shares a's end but starts at -inf: a finished_by it
+        let open_start = parse_lexical_interval("../2025-04-01T00:00:00Z").unwrap();
+        assert!(interval_relation(&a, Finishes, &open_start));
+        assert!(interval_relation(&open_start, FinishedBy, &a));
+        assert!(!interval_relation(&a, During, &open_start)); // shared end: not strictly inside
+                                                              // a meets an open-end interval starting at a's end
+        let open_end = parse_lexical_interval("2025-04-01T00:00:00Z/..").unwrap();
+        assert!(interval_relation(&a, Meets, &open_end));
+        // and open_end is met-by a (a meets open_end — inverse)
+        assert!(interval_relation(&open_end, MetBy, &a));
+        // but +inf meets/befores nothing: open_end's own end can never equal a start
+        assert!(!interval_relation(&open_end, Meets, &a));
+        assert!(!interval_relation(&open_end, Before, &a));
+        // unknown endpoints are NULL: every relation false
+        let unk = parse_lexical_interval("/2025-04-01").unwrap();
+        for rel in [Before, Meets, Overlaps, Starts, During, Finishes, Equals] {
+            assert!(!interval_relation(&unk, rel, &a), "{rel:?}");
+        }
+        // two unknowns never equal
+        let unk2 = parse_lexical_interval("/2025-06-01").unwrap();
+        assert!(!interval_relation(&unk, Equals, &unk2));
     }
 }

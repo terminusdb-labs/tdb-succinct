@@ -937,7 +937,11 @@ fn reconstruct_component_canonical(f: &FiniteComponent, is_end: bool) -> String 
         .int
         .to_i64()
         .expect("finite seconds outside i64 — unreachable via parse");
-    if f.is_neg && f.frac.as_deref().map_or(false, |d| d.bytes().any(|b| b != b'0')) {
+    if f.is_neg
+        && f.frac
+            .as_deref()
+            .map_or(false, |d| d.bytes().any(|b| b != b'0'))
+    {
         secs -= 1;
     }
     match f.tz_class {
@@ -1928,9 +1932,10 @@ mod tests {
         // 0.5 < 0.5000000000…01 < 0.500000001
         assert!(a < c);
         assert!(c < b);
-        // equal instant, trimmable spelling: canonicalises to one literal
+        // equal instant, distinct precision: `.5` and `.50` are different
+        // literals that must stay adjacent — spelling is the tie-break
         let d = entry("2025-01-01T00:00:00.50Z/2026-01-01T00:00:00Z");
-        assert_eq!(a, d); // .5 and .50 are the same entry
+        assert!(a < d && d < c, ".5 < .50 < .500…01");
     }
 
     #[test]
@@ -2287,17 +2292,14 @@ mod tests {
     #[test]
     fn order_precision_and_spelling_tiebreaks() {
         // Distinct instants order by exact value at any precision; equal
-        // instants differing only in spelling dedup to one literal (trailing
-        // zeros are cut in canonicalisation).
+        // instants differing only in precision stay adjacent, ordered by
+        // spelling (`.5` < `.50` < `.500`): zeros are significant.
         let e = "2030-01-01";
-        assert_eq!(
-            entry("2025-03-15T10:30:00.5/2030-01-01"),
-            entry("2025-03-15T10:30:00.50/2030-01-01"),
-            ".5 and .50 are the same literal after canonicalisation"
-        );
         let expected = [
             format!("2025-03-15T10:30:00.499999999999999999/{e}"),
             format!("2025-03-15T10:30:00.5/{e}"),
+            format!("2025-03-15T10:30:00.50/{e}"),
+            format!("2025-03-15T10:30:00.500/{e}"),
             format!("2025-03-15T10:30:00.500000000000000001/{e}"),
             format!("2025-03-15T10:30:00.999999999999999999/{e}"),
         ];
@@ -2444,31 +2446,62 @@ mod tests {
         assert_eq!(sorted_rendered(&shuffled), SPELLINGS);
     }
 
-    /// Spellings that normalise: `.50` == `.5` — they are the same instant,
-    /// so they must encode to the identical entry. Likewise a fully-zero
-    /// fraction collapses to the whole-second literal.
+    /// Spellings differ by precision: `.50` ≠ `.5` — the trailing zero is a
+    /// supplied significant figure and must round-trip verbatim. A fully-zero
+    /// fraction keeps its dot and digits too.
     #[test]
-    fn fraction_trailing_zeros_canonicalise_to_same_entry() {
+    fn fraction_trailing_zeros_are_distinct_literals() {
         let variants = [
             "2025-03-15T10:30:00.5/2030-01-01",
             "2025-03-15T10:30:00.50/2030-01-01",
             "2025-03-15T10:30:00.500/2030-01-01",
             "2025-03-15T10:30:00.500000000/2030-01-01",
         ];
-        let first = entry(variants[0]);
-        for v in &variants[1..] {
-            assert_eq!(entry(v), first, "{v} must encode like .5");
+        let mut entries: Vec<Vec<u8>> = variants.iter().map(|v| entry(v)).collect();
+        for e in entries.windows(2) {
+            assert_ne!(e[0], e[1]);
+            assert!(e[0] < e[1], "precision spellings order short to long");
         }
-        // and the rendered canonical form is the trimmed one
+        // each spelling renders back verbatim
+        for (i, v) in variants.iter().enumerate() {
+            let rendered = render_lexical_interval(&decode_lexical_entry(&entries[i]).unwrap());
+            assert_eq!(&rendered, v);
+        }
+        entries.clear();
+        // all-zero fraction keeps its digits
+        let zero = entry("2025-03-15T10:30:00.000/2030-01-01");
         assert_eq!(
-            render_lexical_interval(&decode_lexical_entry(&entry(variants[1])).unwrap()),
-            "2025-03-15T10:30:00.5/2030-01-01"
+            render_lexical_interval(&decode_lexical_entry(&zero).unwrap()),
+            "2025-03-15T10:30:00.000/2030-01-01"
         );
-        // all-zero fraction == no fraction
-        assert_eq!(
-            entry("2025-03-15T10:30:00.000/2030-01-01"),
-            entry("2025-03-15T10:30:00/2030-01-01")
-        );
+        // and sorts after the fraction-less twin
+        assert!(entry("2025-03-15T10:30:00/2030-01-01") < zero);
+    }
+
+    /// Negative instants keep precision too: the complement encoding
+    /// `(10^len − f) mod 10^len` preserves digit count, and an all-zero
+    /// fraction on a negative value stays integral (`.00` = −1.00 → int −1).
+    #[test]
+    fn negative_fraction_precision_round_trips() {
+        for v in [
+            "1969-12-31T23:59:59.5Z/1970-01-02",
+            "1969-12-31T23:59:59.50Z/1970-01-02",
+            "1969-12-31T23:59:59.00Z/1970-01-02",
+            "1969-12-31T23:59:59.999Z/1970-01-02",
+        ] {
+            let e = entry(v);
+            assert_eq!(
+                render_lexical_interval(&decode_lexical_entry(&e).unwrap()),
+                v,
+                "{v}"
+            );
+        }
+        // equal-instant precision spellings still sort adjacent; negative
+        // frac bytes are complemented, so the spelling order mirrors value
+        // direction (.50 encodes before .5 below the epoch)
+        let half = entry("1969-12-31T23:59:59.5Z/1970-01-02");
+        let half0 = entry("1969-12-31T23:59:59.50Z/1970-01-02");
+        assert!(half0 < half);
     }
 
     /// Accepted-but-normalised forms render in extended canonical spelling.

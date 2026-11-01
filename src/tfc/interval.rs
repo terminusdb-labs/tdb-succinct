@@ -39,6 +39,8 @@ pub enum IntervalParseError {
     NoDates(String),
     #[error("duration combined with an open or unknown endpoint: `{0}`")]
     UnboundedWithDuration(String),
+    #[error("duration fraction finer than nanoseconds: `{0}`")]
+    DurationTooPrecise(String),
 }
 
 /// A non-finite interval endpoint per ISO 8601-2: open (`..`) or unknown
@@ -380,6 +382,13 @@ pub(crate) fn parse_iso_duration(s: &str) -> Result<Duration, IntervalParseError
                     let d = DurationDesignator::Second;
                     validate_designator_order(&last_designator, d).map_err(|_| err())?;
                     last_designator = Some(d);
+                    // duration arithmetic runs at nanos — a finer supplied
+                    // fraction would silently truncate, so it is rejected
+                    if let Some(dot) = num_buf.find('.') {
+                        if num_buf.len() - dot - 1 > 9 {
+                            return Err(IntervalParseError::DurationTooPrecise(s.to_string()));
+                        }
+                    }
                     second = num_buf.parse::<f64>().map_err(|_| err())?;
                     num_buf.clear();
                 }

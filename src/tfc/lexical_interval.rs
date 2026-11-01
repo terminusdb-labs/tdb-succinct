@@ -174,9 +174,16 @@ pub struct FiniteComponent {
     /// Signed ceiling integer seconds (`-1.5` stores int=-1, frac="5").
     pub int: Integer,
     /// Canonical fraction digits (trailing zeros stripped); None = integral.
+    /// The instant field encodes the *value*, so equal-instant spellings
+    /// share the ordering key — semantic comparison falls out of byte order.
     /// For negatives the fraction counts *down* from the ceiling int:
     /// `int - frac/10^len`.
     pub frac: Option<String>,
+    /// Supplied fraction digit count (0 = no fraction). The supplied digits
+    /// are always `canonical + trailing zeros`, so this byte preserves
+    /// precision: `.5`, `.50`, `.500` are the same instant but distinct
+    /// literals, and `.00` renders back with its dot.
+    pub frac_len: u8,
     pub kind: u8,
     pub tz_class: u8,
     /// Signed offset minutes; only meaningful for TZ_NEG / TZ_POS.
@@ -383,31 +390,46 @@ fn parse_zone(s: &str) -> (&str, u8, i16) {
     (s, TZ_ZONELESS, 0)
 }
 
-/// (is_neg, signed ceiling int, verbatim frac) from seconds + frac digits.
-/// Trailing zeros are precision: `.5`, `.50` and `.500` are distinct literals.
+/// (is_neg, signed ceiling int, canonical frac, supplied digit count) from
+/// seconds + supplied frac digits. The canonical digits carry the value —
+/// trailing zeros are precision and live only in `frac_len`.
 /// Negatives use the ceiling convention: value = `int - frac/10^len`, so
-/// `secs=-2, frac="5"` (v=-1.5) stores int=-1, frac="5" (= 10-5). The stored
-/// digits are `(10^len - f) mod 10^len` — all-zero fractions stay "00…0" and
-/// keep the ceiling int unchanged (the value is integral).
-fn instant_parts(secs: i64, frac: Option<String>) -> (bool, Integer, Option<String>) {
+/// `secs=-2, frac="5"` (v=-1.5) stores int=-1, frac="5" (= 10-5). An
+/// integral negative (`.00`) stores no canonical frac; its dot survives
+/// through `frac_len` alone.
+fn instant_parts(secs: i64, frac: Option<String>) -> (bool, Integer, Option<String>, u8) {
+    let canon = |f: &str| {
+        let t = f.trim_end_matches('0');
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+    let supplied_len = frac.as_deref().map_or(0, |f| {
+        u8::try_from(f.len()).expect("fraction longer than 255 digits")
+    });
     if secs >= 0 {
-        return (false, Integer::from(secs), frac);
+        return (
+            false,
+            Integer::from(secs),
+            frac.as_deref().and_then(canon),
+            supplied_len,
+        );
     }
     match frac {
-        None => (true, Integer::from(secs), None),
+        None => (true, Integer::from(secs), None, 0),
         Some(f) => {
-            // v = secs + f/10^len < 0 → stored = (10^len - f) mod 10^len,
-            // int = secs + 1 unless the value is integral (stored == 0).
+            // v = secs + f/10^len < 0 → canonical digits are the
+            // 10^len − f complement, trimmed; an integral value keeps int.
             let len = f.len();
             let ten = format!("1{}", "0".repeat(len)).parse::<Integer>().unwrap();
             let comp = (&ten - f.parse::<Integer>().unwrap()) % &ten;
-            let integral = comp == 0;
+            if comp == 0 {
+                return (true, Integer::from(secs), None, supplied_len);
+            }
             let digits = format!("{:0>width$}", comp.to_string(), width = len);
-            (
-                true,
-                Integer::from(secs + i64::from(!integral)),
-                Some(digits),
-            )
+            (true, Integer::from(secs + 1), canon(&digits), supplied_len)
         }
     }
 }
@@ -435,11 +457,12 @@ fn parse_finite(s: &str, is_end: bool) -> Result<FiniteComponent, LexicalInterva
                 offset_minutes
             },
         );
-        let (is_neg, int, frac) = instant_parts(secs, frac);
+        let (is_neg, int, frac, frac_len) = instant_parts(secs, frac);
         Ok(FiniteComponent {
             is_neg,
             int,
             frac,
+            frac_len,
             kind: KIND_DATETIME,
             tz_class,
             offset_minutes: offset_minutes.abs(),
@@ -453,11 +476,12 @@ fn parse_finite(s: &str, is_end: bool) -> Result<FiniteComponent, LexicalInterva
             date = date.succ_opt().unwrap_or(date);
         }
         let secs = leap_aware_secs(date, 0, 0);
-        let (is_neg, int, frac) = instant_parts(secs, None);
+        let (is_neg, int, frac, frac_len) = instant_parts(secs, None);
         Ok(FiniteComponent {
             is_neg,
             int,
             frac,
+            frac_len,
             kind: KIND_DATE,
             tz_class: TZ_ZONELESS,
             offset_minutes: 0,
@@ -480,11 +504,13 @@ fn computed_finite(
     } else {
         Some(format!("{:09}", nanos))
     };
-    let (is_neg, int, frac) = instant_parts(secs, frac);
+    let (is_neg, int, frac, _) = instant_parts(secs, frac);
+    let frac_len = frac.as_deref().map_or(0, |d| d.len() as u8);
     FiniteComponent {
         is_neg,
         int,
         frac,
+        frac_len,
         kind,
         tz_class,
         offset_minutes: offset_minutes.abs(),
@@ -623,18 +649,13 @@ fn secs_nanos(f: &FiniteComponent) -> (i64, u32) {
         // value = int + 0.frac → floor secs = int
         Some(d) if !f.is_neg => (int, nanos9(d)),
         // value = int - 0.frac → floor secs = int - 1, subsec = 1 - 0.frac
-        // (the 10^len - frac complement, truncated to nanos). A stored
-        // all-zero frac is an integral value: floor is int itself.
+        // (the 10^len - frac complement, truncated to nanos).
         Some(d) => {
             let len = d.len();
             let ten = format!("1{}", "0".repeat(len)).parse::<Integer>().unwrap();
-            let comp = (&ten - d.parse::<Integer>().unwrap()) % &ten;
-            if comp == 0 {
-                (int, 0)
-            } else {
-                let padded = format!("{:0>width$}", comp.to_string(), width = len);
-                (int - 1, nanos9(&padded))
-            }
+            let comp = &ten - d.parse::<Integer>().unwrap();
+            let padded = format!("{:0>width$}", comp.to_string(), width = len);
+            (int - 1, nanos9(&padded))
         }
     }
 }
@@ -666,11 +687,14 @@ fn component_instant_key(c: &Component, is_start: bool, out: &mut BytesMut) {
     }
 }
 
-/// kind + timeshift — finite components only.
+/// kind + timeshift + supplied frac length — finite components only.
+/// `frac_len` is a spelling field: it preserves precision without
+/// touching the semantic instant ordering.
 fn component_meta_key(c: &Component, out: &mut BytesMut) {
     if let Component::Finite(f) = c {
         out.put_u8(f.kind);
         tz_bytes(f, out);
+        out.put_u8(f.frac_len);
     }
 }
 
@@ -686,10 +710,12 @@ fn instant_floor(f: &FiniteComponent, shift: i64) -> (i64, Option<String>) {
         Some(d) => {
             let len = d.len();
             let ten = format!("1{}", "0".repeat(len)).parse::<Integer>().unwrap();
-            let raw = (&ten - d.parse::<Integer>().unwrap()) % &ten;
-            let comp = format!("{:0>width$}", raw.to_string(), width = len);
-            // integral value (stored "00…0"): floor is int itself
-            (int - i64::from(raw != 0) + shift, Some(comp))
+            let comp = format!(
+                "{:0>width$}",
+                (&ten - d.parse::<Integer>().unwrap()).to_string(),
+                width = len
+            );
+            (int - 1 + shift, Some(comp))
         }
     }
 }
@@ -937,11 +963,7 @@ fn reconstruct_component_canonical(f: &FiniteComponent, is_end: bool) -> String 
         .int
         .to_i64()
         .expect("finite seconds outside i64 — unreachable via parse");
-    if f.is_neg
-        && f.frac
-            .as_deref()
-            .map_or(false, |d| d.bytes().any(|b| b != b'0'))
-    {
+    if f.is_neg && f.frac.is_some() {
         secs -= 1;
     }
     match f.tz_class {
@@ -975,20 +997,31 @@ fn reconstruct_component_canonical(f: &FiniteComponent, is_end: bool) -> String 
                 naive.second()
             ));
         }
-        if let Some(d) = &f.frac {
-            let digits = if f.is_neg {
-                // stored digits are the complement (10^len − supplied) mod 10^len
-                let ten: Integer = format!("1{}", "0".repeat(d.len())).parse().unwrap();
-                format!(
-                    "{:0>w$}",
-                    ((&ten - d.parse::<Integer>().unwrap()) % &ten).to_string(),
-                    w = d.len()
-                )
-            } else {
-                d.clone()
+        if f.frac_len > 0 {
+            let supplied = match &f.frac {
+                Some(d) => {
+                    let canonical = if f.is_neg {
+                        // stored digits are the 10^len − supplied complement
+                        let ten: Integer = format!("1{}", "0".repeat(d.len())).parse().unwrap();
+                        format!(
+                            "{:0>w$}",
+                            (&ten - d.parse::<Integer>().unwrap()).to_string(),
+                            w = d.len()
+                        )
+                    } else {
+                        d.clone()
+                    };
+                    canonical
+                }
+                // integral value with a supplied fraction: all zeros
+                None => String::new(),
             };
             out.push('.');
-            out.push_str(&digits);
+            out.push_str(&supplied);
+            // canonical + trailing zeros = the supplied digit count
+            for _ in (supplied.len())..f.frac_len as usize {
+                out.push('0');
+            }
         }
         match f.tz_class {
             TZ_NEG | TZ_POS => out.push_str(&format!(
@@ -1055,6 +1088,7 @@ fn decode_finite(bytes: &mut &[u8]) -> Result<FiniteComponent, LexicalIntervalEr
         } else {
             Some(frac_str)
         },
+        frac_len: 0,
         kind: 0,
         tz_class: 0,
         offset_minutes: 0,
@@ -1062,8 +1096,8 @@ fn decode_finite(bytes: &mut &[u8]) -> Result<FiniteComponent, LexicalIntervalEr
     })
 }
 
-/// kind + timeshift for a finite component — the meta block's position in
-/// the entry layout.
+/// kind + timeshift + supplied frac length for a finite component — the
+/// meta block's position in the entry layout.
 fn decode_meta(f: &mut FiniteComponent, bytes: &mut &[u8]) -> Result<(), LexicalIntervalError> {
     if bytes.len() < 2 {
         return Err(LexicalIntervalError::MalformedEntry);
@@ -1081,6 +1115,16 @@ fn decode_meta(f: &mut FiniteComponent, bytes: &mut &[u8]) -> Result<(), Lexical
     } else {
         0
     };
+    if bytes.is_empty() {
+        return Err(LexicalIntervalError::MalformedEntry);
+    }
+    f.frac_len = bytes.get_u8();
+    // supplied digits are canonical + zeros: len 0 means no canonical frac,
+    // and a shorter supplied length is impossible
+    let canon_len = f.frac.as_deref().map_or(0, |d| d.len()) as usize;
+    if (f.frac_len == 0 && f.frac.is_some()) || (f.frac_len as usize) < canon_len {
+        return Err(LexicalIntervalError::MalformedEntry);
+    }
     Ok(())
 }
 
@@ -1206,7 +1250,7 @@ fn lexical_probe_key(secs: i64, nanos: u32, max_tail: bool) -> Bytes {
     assert!(nanos < 1_000_000_000, "nanos must be < 1_000_000_000");
     let secs = posix_to_leap_aware_secs(secs);
     let frac = (nanos != 0).then(|| format!("{nanos:09}"));
-    let (is_neg, int, frac) = instant_parts(secs, frac);
+    let (is_neg, int, frac, _) = instant_parts(secs, frac);
     let mut buf = BytesMut::new();
     buf.put_u8(START_FINITE);
     buf.extend(integer_and_fraction_to_storage(
@@ -1342,12 +1386,8 @@ impl TypedDict {
         };
         let lo = match self.lexical_probe(&lexical_probe_key(secs, nanos, false)) {
             Some((k, _)) => (k + 1).clamp(seg.start, seg.end),
-            None => {
-                return StartIdRanges {
-                    special: 0..0,
-                    finite: 0..0,
-                }
-            }
+            // probe below every entry: the equal block, if any, starts the segment
+            None => seg.start,
         };
         let hi = match self.lexical_probe(&lexical_probe_key(secs, nanos, true)) {
             Some((k, _)) => (k + 1).clamp(seg.start, seg.end),
@@ -1553,10 +1593,12 @@ fn legacy_component(
     } else {
         (TZ_Z, 0)
     };
+    let frac_len = frac.as_deref().map_or(0, |d| d.len() as u8);
     let mut f = FiniteComponent {
         is_neg,
         int,
         frac,
+        frac_len,
         kind: if component_type == INTERVAL_COMPONENT_DATE {
             KIND_DATE
         } else {
@@ -1804,6 +1846,36 @@ mod tests {
         assert_eq!(dict.lexical_ids_start_eq(S2, 0).finite, 7..9);
         assert_eq!(dict.lexical_ids_start_eq(S1, 0).finite, 6..7);
         assert_eq!(dict.lexical_ids_start_eq(S1 + 1, 0).finite, 7..7);
+    }
+
+    /// Semantic comparison: probes compare the instant *value*, not the
+    /// spelling. Every literal denoting 2025-03-01T00:00:00Z — different
+    /// fraction precisions, zone spellings, date vs dateTime kind — shares
+    /// the instant field and must sit inside the eq range.
+    #[test]
+    fn probe_eq_unifies_same_instant_spellings() {
+        let dict = build_dict(vec![
+            // ids 1-8: spellings of the same instant (S2), sorted:
+            // date kind < datetime, then tz class, then frac length
+            iv_entry("2025-03-01/2030-01-01"), // 1 date kind
+            iv_entry("2025-03-01T00:00:00-00:00/2030-01-01"), // 2 -00:00
+            iv_entry("2025-03-01T00:00:00Z/2030-01-01"), // 3 Z
+            iv_entry("2025-03-01T00:00:00.0Z/2030-01-01"), // 4 Z .0
+            iv_entry("2025-03-01T00:00:00.000Z/2030-01-01"), // 5 Z .000
+            iv_entry("2025-03-01T00:00:00/2030-01-01"), // 6 zone-less
+            iv_entry("2025-03-01T00:00:00.00+00:00/2030-01-01"), // 7 +00:00 .00
+            iv_entry("2025-03-01T01:00:00+01:00/2030-01-01"), // 8 +01:00
+            iv_entry("2025-03-01T00:00:01Z/2030-01-01"), // 9 later instant
+        ]);
+        // one second boundary covers every spelling of the instant
+        assert_eq!(dict.lexical_ids_start_eq(S2, 0).finite, 1..9);
+        // le includes them (plus anything earlier — none here)
+        assert_eq!(dict.lexical_ids_start_le(S2, 0).finite, 1..9);
+        // ge includes the block and everything after
+        assert_eq!(dict.lexical_ids_start_ge(S2, 0).finite, 1..10);
+        // lt / gt exclude the whole equal-instant block
+        assert_eq!(dict.lexical_ids_start_lt(S2, 0).finite, 1..1);
+        assert_eq!(dict.lexical_ids_start_gt(S2, 0).finite, 9..10);
     }
 
     #[test]
@@ -2496,12 +2568,40 @@ mod tests {
                 "{v}"
             );
         }
-        // equal-instant precision spellings still sort adjacent; negative
-        // frac bytes are complemented, so the spelling order mirrors value
-        // direction (.50 encodes before .5 below the epoch)
+        // equal instant fields → ordering falls through every value field
+        // to the spelling tail: supplied length is the tie-break, so .5
+        // precedes .50 below the epoch exactly as above it
         let half = entry("1969-12-31T23:59:59.5Z/1970-01-02");
         let half0 = entry("1969-12-31T23:59:59.50Z/1970-01-02");
-        assert!(half0 < half);
+        assert!(half < half0);
+    }
+
+    /// Supplied duration fractions keep their precision in the period
+    /// spelling, but the anchor is computed at nanos — a finer fraction
+    /// must fail loudly rather than truncate.
+    #[test]
+    fn duration_fraction_precision() {
+        // supplied spelling survives verbatim
+        for v in ["2025-01-01/PT0.50S", "PT0.500S/2025-01-01"] {
+            let e = entry(v);
+            assert_eq!(
+                render_lexical_interval(&decode_lexical_entry(&e).unwrap()),
+                v
+            );
+        }
+        // 9 digits is the nanos floor: accepted, computed end carries it
+        let e = entry("2025-01-01T00:00:00Z/PT0.123456789S");
+        assert_eq!(
+            render_lexical_interval(&decode_lexical_entry(&e).unwrap()),
+            "2025-01-01T00:00:00Z/PT0.123456789S"
+        );
+        // 10 digits is unrepresentable — parse must fail, not truncate
+        assert!(matches!(
+            parse_lexical_interval("2025-01-01/PT0.5000000001S"),
+            Err(LexicalIntervalError::Parse(
+                crate::tfc::interval::IntervalParseError::DurationTooPrecise(_)
+            ))
+        ));
     }
 
     /// Accepted-but-normalised forms render in extended canonical spelling.

@@ -3,7 +3,7 @@ use std::hint::black_box;
 use std::time::Instant;
 use tdb_succinct::tfc::decimal::integer_and_fraction_to_storage;
 use tdb_succinct::tfc::interval::IntervalEndIndex;
-use tdb_succinct::tfc::interval2::{
+use tdb_succinct::tfc::lexical_interval::{
     decode_lexical_entry, encode_lexical_interval, parse_lexical_interval, render_lexical_interval,
     Component, TZ_NEG, TZ_POS,
 };
@@ -345,15 +345,11 @@ fn entry_composition() {
     let comp = |c: &Component| -> (usize, usize) {
         match c {
             Component::Finite(f) => {
-                let inst = 1 + integer_and_fraction_to_storage(
-                    f.is_neg,
-                    f.int.clone(),
-                    f.frac.as_deref(),
-                )
-                .len();
+                let inst =
+                    1 + integer_and_fraction_to_storage(f.is_neg, f.int.clone(), f.frac.as_deref())
+                        .len();
                 // kind (1) + tshift class (1) + offset i16 for ±HH:MM
-                let meta =
-                    1 + 1 + usize::from(f.tz_class == TZ_NEG || f.tz_class == TZ_POS) * 2;
+                let meta = 1 + 1 + usize::from(f.tz_class == TZ_NEG || f.tz_class == TZ_POS) * 2;
                 (inst, meta)
             }
             _ => (1, 0), // special classes contribute their class byte only

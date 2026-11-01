@@ -109,6 +109,17 @@ fn leap_aware_secs(date: NaiveDate, sod: i64, offset_minutes: i16) -> i64 {
     base + leaps_before(day_key(date)) + sod - offset_minutes as i64 * 60
 }
 
+/// POSIX epoch seconds → leap-aware seconds: the domain that instants, probe
+/// boundaries and end-index rank keys live in. Adds the count of leap days
+/// strictly before the instant's wall date.
+pub fn posix_to_leap_aware_secs(secs: i64) -> i64 {
+    secs + leaps_before(day_key(
+        chrono::DateTime::from_timestamp(secs, 0)
+            .expect("instant in chrono range")
+            .date_naive(),
+    ))
+}
+
 /// Inverse of `leap_aware_secs` at zero offset: the wall-clock reading of a
 /// leap-aware instant, plus whether the instant is the day's `23:59:60`
 /// second. The wall date is within two days of the posix approximation — the
@@ -243,15 +254,6 @@ fn canonicalise_component(s: &str) -> String {
             _ => out.push(ch),
         }
     }
-    // `.50` and `.5` are the same instant — cut trailing zeros so identical
-    // instants dedup to one literal. A fully-zero fraction loses its dot too.
-    if let Some(dot) = out.find('.') {
-        let frac_end = dot + 1 + out[dot + 1..].trim_end_matches('0').len();
-        out.truncate(frac_end.max(dot + 1));
-        if out.len() == dot + 1 {
-            out.truncate(dot);
-        }
-    }
     out
 }
 
@@ -381,31 +383,31 @@ fn parse_zone(s: &str) -> (&str, u8, i16) {
     (s, TZ_ZONELESS, 0)
 }
 
-/// (is_neg, signed ceiling int, canonical frac) from seconds + frac digits.
+/// (is_neg, signed ceiling int, verbatim frac) from seconds + frac digits.
+/// Trailing zeros are precision: `.5`, `.50` and `.500` are distinct literals.
 /// Negatives use the ceiling convention: value = `int - frac/10^len`, so
-/// `secs=-2, frac="5"` (v=-1.5) stores int=-1, frac="5" (= 10-5).
+/// `secs=-2, frac="5"` (v=-1.5) stores int=-1, frac="5" (= 10-5). The stored
+/// digits are `(10^len - f) mod 10^len` — all-zero fractions stay "00…0" and
+/// keep the ceiling int unchanged (the value is integral).
 fn instant_parts(secs: i64, frac: Option<String>) -> (bool, Integer, Option<String>) {
-    let canon = |f: String| {
-        let t = f.trim_end_matches('0');
-        if t.is_empty() {
-            None
-        } else {
-            Some(t.to_string())
-        }
-    };
     if secs >= 0 {
-        return (false, Integer::from(secs), frac.and_then(canon));
+        return (false, Integer::from(secs), frac);
     }
     match frac {
         None => (true, Integer::from(secs), None),
-        Some(f) if f.chars().all(|c| c == '0') => (true, Integer::from(secs), None),
         Some(f) => {
-            // v = secs + f/10^len < 0 → int = secs + 1, frac = 10^len - f
+            // v = secs + f/10^len < 0 → stored = (10^len - f) mod 10^len,
+            // int = secs + 1 unless the value is integral (stored == 0).
             let len = f.len();
             let ten = format!("1{}", "0".repeat(len)).parse::<Integer>().unwrap();
-            let comp = &ten - f.parse::<Integer>().unwrap();
+            let comp = (&ten - f.parse::<Integer>().unwrap()) % &ten;
+            let integral = comp == 0;
             let digits = format!("{:0>width$}", comp.to_string(), width = len);
-            (true, Integer::from(secs + 1), canon(digits))
+            (
+                true,
+                Integer::from(secs + i64::from(!integral)),
+                Some(digits),
+            )
         }
     }
 }
@@ -621,13 +623,18 @@ fn secs_nanos(f: &FiniteComponent) -> (i64, u32) {
         // value = int + 0.frac → floor secs = int
         Some(d) if !f.is_neg => (int, nanos9(d)),
         // value = int - 0.frac → floor secs = int - 1, subsec = 1 - 0.frac
-        // (the 10^len - frac complement, truncated to nanos).
+        // (the 10^len - frac complement, truncated to nanos). A stored
+        // all-zero frac is an integral value: floor is int itself.
         Some(d) => {
             let len = d.len();
             let ten = format!("1{}", "0".repeat(len)).parse::<Integer>().unwrap();
-            let comp = &ten - d.parse::<Integer>().unwrap();
-            let padded = format!("{:0>width$}", comp.to_string(), width = len);
-            (int - 1, nanos9(&padded))
+            let comp = (&ten - d.parse::<Integer>().unwrap()) % &ten;
+            if comp == 0 {
+                (int, 0)
+            } else {
+                let padded = format!("{:0>width$}", comp.to_string(), width = len);
+                (int - 1, nanos9(&padded))
+            }
         }
     }
 }
@@ -679,12 +686,10 @@ fn instant_floor(f: &FiniteComponent, shift: i64) -> (i64, Option<String>) {
         Some(d) => {
             let len = d.len();
             let ten = format!("1{}", "0".repeat(len)).parse::<Integer>().unwrap();
-            let comp = format!(
-                "{:0>width$}",
-                (&ten - d.parse::<Integer>().unwrap()).to_string(),
-                width = len
-            );
-            (int - 1 + shift, Some(comp))
+            let raw = (&ten - d.parse::<Integer>().unwrap()) % &ten;
+            let comp = format!("{:0>width$}", raw.to_string(), width = len);
+            // integral value (stored "00…0"): floor is int itself
+            (int - i64::from(raw != 0) + shift, Some(comp))
         }
     }
 }
@@ -926,12 +931,13 @@ fn period_key(iv: &LexicalInterval) -> String {
 /// from `instant ± offset`, fraction digits from the stored (complemented
 /// for negatives) digits, zone marker from the tshift class.
 fn reconstruct_component_canonical(f: &FiniteComponent, is_end: bool) -> String {
-    // floor seconds: ceiling-frac negatives step one more down
+    // floor seconds: ceiling-frac negatives step one more down; a stored
+    // all-zero frac is integral and needs no step
     let mut secs = f
         .int
         .to_i64()
         .expect("finite seconds outside i64 — unreachable via parse");
-    if f.is_neg && f.frac.is_some() {
+    if f.is_neg && f.frac.as_deref().map_or(false, |d| d.bytes().any(|b| b != b'0')) {
         secs -= 1;
     }
     match f.tz_class {
@@ -967,11 +973,11 @@ fn reconstruct_component_canonical(f: &FiniteComponent, is_end: bool) -> String 
         }
         if let Some(d) = &f.frac {
             let digits = if f.is_neg {
-                // stored digits are the complement 10^len − supplied
+                // stored digits are the complement (10^len − supplied) mod 10^len
                 let ten: Integer = format!("1{}", "0".repeat(d.len())).parse().unwrap();
                 format!(
                     "{:0>w$}",
-                    (&ten - d.parse::<Integer>().unwrap()).to_string(),
+                    ((&ten - d.parse::<Integer>().unwrap()) % &ten).to_string(),
                     w = d.len()
                 )
             } else {
@@ -1194,14 +1200,7 @@ fn lexical_probe_key(secs: i64, nanos: u32, max_tail: bool) -> Bytes {
     // nanos ≥ 1e9 would canonicalise to a *smaller* instant's fraction — the
     // caller gets a silently wrong boundary, so this is a hard contract.
     assert!(nanos < 1_000_000_000, "nanos must be < 1_000_000_000");
-    // posix → leap-aware: add the count of leap days strictly before the
-    // boundary's wall date
-    let secs = secs
-        + leaps_before(day_key(
-            chrono::DateTime::from_timestamp(secs, 0)
-                .expect("probe instant in chrono range")
-                .date_naive(),
-        ));
+    let secs = posix_to_leap_aware_secs(secs);
     let frac = (nanos != 0).then(|| format!("{nanos:09}"));
     let (is_neg, int, frac) = instant_parts(secs, frac);
     let mut buf = BytesMut::new();
@@ -1447,6 +1446,256 @@ impl IntervalEndIndex {
             tree.into_parts().1,
         ))
     }
+}
+
+// -- legacy fixed-width conversion ---------------------------------------------
+//
+// Layers written before the lexical format hold fixed-width entries: the
+// shipped 48-byte width (UTC-normalised, no zone designator, finite
+// endpoints only) and the branch-internal 52-byte width (zone designator +
+// open/unknown sentinels, never shipped). Layer-open upgrades them to
+// lexical entries in memory so every downstream reader sees one format.
+
+use super::block::SizedDictEntry;
+use super::datatypes::{
+    DateTimeInterval, FromLexical, INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_OPEN,
+    INTERVAL_COMPONENT_UNKNOWN, INTERVAL_ENCODED_WIDTH, INTERVAL_FLAG_DURATION_END,
+    INTERVAL_FLAG_START_DURATION, INTERVAL_LEGACY_ENCODED_WIDTH, INTERVAL_NO_ZONE,
+};
+use super::typed::{TypedDictBufBuilder, TypedDictEntry};
+use crate::logarray::LogArrayFileBuilder;
+use crate::storage::types::{FileLoad, FileStore};
+use crate::wavelettree::build_wavelet_tree_from_iter;
+use std::io;
+
+/// Canonical `P…` rendering of a fixed-width `Duration`, in the shape
+/// `derived_period` emits: zero is `PT0S`, negatives take a leading `-`.
+fn duration_to_period(d: &Duration) -> String {
+    let mut p = String::from("P");
+    if d.year != 0 {
+        p += &format!("{}Y", d.year);
+    }
+    if d.month != 0 {
+        p += &format!("{}M", d.month);
+    }
+    if d.day != 0 {
+        p += &format!("{}D", d.day);
+    }
+    if d.hour != 0 || d.minute != 0 || d.second != 0.0 {
+        p += "T";
+        if d.hour != 0 {
+            p += &format!("{}H", d.hour);
+        }
+        if d.minute != 0 {
+            p += &format!("{}M", d.minute);
+        }
+        if d.second != 0.0 {
+            p += &format!("{}S", d.second);
+        }
+    }
+    if p == "P" {
+        p = "PT0S".to_string();
+    }
+    if d.sign < 0 {
+        format!("-{p}")
+    } else {
+        p
+    }
+}
+
+/// One fixed-width endpoint as a lexical `Component`. The stored seconds are
+/// POSIX, so the leap shift joins here; nanoseconds become canonical fraction
+/// digits; the zone designator maps onto the tshift axis (no-zone →
+/// zone-less, `±0` is unreachable: the fixed format cannot spell `-00:00`).
+fn legacy_component(
+    seconds: i64,
+    nanos: u32,
+    component_type: u8,
+    tz_minutes: i16,
+    is_end: bool,
+) -> Component {
+    match component_type {
+        INTERVAL_COMPONENT_OPEN => return Component::Unbounded,
+        INTERVAL_COMPONENT_UNKNOWN => return Component::Unknown,
+        _ => {}
+    }
+    let s = posix_to_leap_aware_secs(seconds);
+    let (int, frac, is_neg) = if nanos == 0 {
+        (Integer::from(s), None, s < 0)
+    } else if s < 0 {
+        // floor (s, nanos) → ceiling int and complemented fraction
+        (
+            Integer::from(s + 1),
+            Some(
+                format!("{:09}", 1_000_000_000u64 - nanos as u64)
+                    .trim_end_matches('0')
+                    .to_string(),
+            ),
+            true,
+        )
+    } else {
+        (
+            Integer::from(s),
+            Some(format!("{nanos:09}").trim_end_matches('0').to_string()),
+            false,
+        )
+    };
+    let (tz_class, offset_minutes) = if tz_minutes == INTERVAL_NO_ZONE {
+        (TZ_ZONELESS, 0)
+    } else if tz_minutes < 0 {
+        (TZ_NEG, tz_minutes)
+    } else if tz_minutes > 0 {
+        (TZ_POS, tz_minutes)
+    } else {
+        (TZ_Z, 0)
+    };
+    let mut f = FiniteComponent {
+        is_neg,
+        int,
+        frac,
+        kind: if component_type == INTERVAL_COMPONENT_DATE {
+            KIND_DATE
+        } else {
+            KIND_DATETIME
+        },
+        tz_class,
+        offset_minutes,
+        canonical: String::new(),
+    };
+    f.canonical = reconstruct_component_canonical(&f, is_end);
+    Component::Finite(f)
+}
+
+/// A fixed-width `DateTimeInterval` as a `LexicalInterval`. Components, flag
+/// and zone designators carry over; the duration renders canonical.
+pub fn legacy_interval_to_lexical(iv: &DateTimeInterval) -> LexicalInterval {
+    let start = legacy_component(
+        iv.start_seconds,
+        iv.start_nanos,
+        iv.start_type,
+        iv.start_tz,
+        false,
+    );
+    let end = legacy_component(iv.end_seconds, iv.end_nanos, iv.end_type, iv.end_tz, true);
+    let period = duration_to_period(&iv.duration);
+    let canonical = match iv.flag {
+        INTERVAL_FLAG_DURATION_END => {
+            format!("{}/{}", period, component_canonical(&end, true))
+        }
+        INTERVAL_FLAG_START_DURATION => {
+            format!("{}/{}", component_canonical(&start, false), period)
+        }
+        _ => format!(
+            "{}/{}",
+            component_canonical(&start, false),
+            component_canonical(&end, true)
+        ),
+    };
+    LexicalInterval {
+        start,
+        end,
+        flag: iv.flag,
+        canonical,
+    }
+}
+
+impl TypedDict {
+    /// Return a dictionary whose DateTimeInterval segment holds lexical
+    /// entries. Fixed-width entries (the shipped 48-byte width or the
+    /// branch-internal 52-byte width) are decoded and re-encoded as lexical;
+    /// anything else is assumed lexical already and passes through. Runs once
+    /// at layer-open so every downstream reader sees a single format.
+    pub fn upgrade_lexical_intervals(&self) -> Self {
+        let Some(seg) = self.lexical_interval_segment() else {
+            return self.clone();
+        };
+        let legacy = seg.clone().any(|id| {
+            matches!(
+                self.entry(id as usize).map(|e| e.to_bytes().len()),
+                Some(INTERVAL_LEGACY_ENCODED_WIDTH | INTERVAL_ENCODED_WIDTH)
+            )
+        });
+        if !legacy {
+            return self.clone();
+        }
+
+        let mut builder = TypedDictBufBuilder::new(
+            BytesMut::new(),
+            BytesMut::new(),
+            BytesMut::new(),
+            BytesMut::new(),
+        );
+        for entry in self.iter() {
+            let entry = if entry.datatype() == Datatype::DateTimeInterval {
+                let bytes = entry.to_bytes();
+                let lexical = match bytes.len() {
+                    INTERVAL_LEGACY_ENCODED_WIDTH => {
+                        encode_lexical_interval(&legacy_interval_to_lexical(
+                            &DateTimeInterval::from_legacy_lexical(bytes.clone()),
+                        ))
+                    }
+                    INTERVAL_ENCODED_WIDTH => encode_lexical_interval(&legacy_interval_to_lexical(
+                        &DateTimeInterval::from_lexical(bytes.clone()),
+                    )),
+                    _ => bytes.to_vec(),
+                };
+                TypedDictEntry::new(
+                    Datatype::DateTimeInterval,
+                    SizedDictEntry::from(Bytes::copy_from_slice(&lexical)),
+                )
+            } else {
+                entry
+            };
+            builder.add(entry);
+        }
+        let (t, o, bo, d) = builder.finalize();
+        TypedDict::from_parts(t.freeze(), o.freeze(), bo.freeze(), d.freeze())
+    }
+}
+
+/// Build the interval end index over a dictionary whose DateTimeInterval
+/// segment holds lexical entries, writing the four files: the stride-2 end
+/// rank table (`ends`), and the wavelet tree's `bits`, `blocks`, `sblocks`.
+pub async fn build_interval_end_index_lexical<F: 'static + FileLoad + FileStore>(
+    dict: &TypedDict,
+    destination_ends: F,
+    destination_bits: F,
+    destination_blocks: F,
+    destination_sblocks: F,
+) -> io::Result<()> {
+    let mut ends = Vec::new();
+    for id in dict.lexical_interval_segment().unwrap_or(0..0) {
+        let entry = dict.entry(id as usize).expect("interval id in segment");
+        let iv = decode_lexical_entry(&entry.to_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        ends.push(
+            end_rank_key(&iv.end).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        );
+    }
+
+    let mut distinct = ends.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+
+    let mut ends_builder = LogArrayFileBuilder::new(destination_ends.open_write().await?, 64);
+    for &(s, n) in &distinct {
+        ends_builder.push(s as u64).await?;
+        ends_builder.push(n as u64).await?;
+    }
+    ends_builder.finalize().await?;
+
+    let ranks: Vec<u64> = ends
+        .iter()
+        .map(|e| distinct.binary_search(e).unwrap() as u64)
+        .collect();
+    build_wavelet_tree_from_iter(
+        end_rank_width(distinct.len()),
+        ranks.into_iter(),
+        destination_bits,
+        destination_blocks,
+        destination_sblocks,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2561,5 +2810,130 @@ mod tests {
             raw_m as f64 / mixed.len() as f64,
             coded_m as f64 / mixed.len() as f64
         );
+    }
+
+    // -- legacy conversion ---------------------------------------------------
+
+    fn legacy_entry(s: &str) -> TypedDictEntry {
+        use crate::tfc::datatypes::TdbDataType;
+        DateTimeInterval::make_entry(&crate::tfc::interval::parse_iso_interval(s).unwrap())
+    }
+
+    fn legacy_dti(s: &str) -> DateTimeInterval {
+        DateTimeInterval::from_lexical(legacy_entry(s).to_bytes())
+    }
+
+    #[test]
+    fn legacy_explicit_pair_renders_identically() {
+        let iv =
+            legacy_interval_to_lexical(&legacy_dti("2025-01-01T10:30:00Z/2025-03-31T12:45:00Z"));
+        assert_eq!(
+            "2025-01-01T10:30:00Z/2025-03-31T12:45:00Z",
+            render_lexical_interval(&iv)
+        );
+    }
+
+    #[test]
+    fn legacy_offset_zone_round_trips() {
+        let iv = legacy_interval_to_lexical(&legacy_dti(
+            "2025-01-01T10:30:00+01:00/2025-03-31T12:45:00+01:00",
+        ));
+        assert_eq!(
+            "2025-01-01T10:30:00+01:00/2025-03-31T12:45:00+01:00",
+            render_lexical_interval(&iv)
+        );
+    }
+
+    #[test]
+    fn legacy_date_pair_renders_dates() {
+        let iv = legacy_interval_to_lexical(&legacy_dti("2025-01-01/2025-04-01"));
+        assert_eq!("2025-01-01/2025-04-01", render_lexical_interval(&iv));
+    }
+
+    #[test]
+    fn legacy_duration_forms_keep_period_side() {
+        let iv = legacy_interval_to_lexical(&legacy_dti("2025-01-01/P3M"));
+        assert_eq!("2025-01-01/P3M", render_lexical_interval(&iv));
+        let iv = legacy_interval_to_lexical(&legacy_dti("P3M/2025-03-31"));
+        assert_eq!("P3M/2025-03-31", render_lexical_interval(&iv));
+    }
+
+    #[test]
+    fn legacy_special_endpoints_convert() {
+        let iv = legacy_interval_to_lexical(&legacy_dti("../2025-01-01"));
+        assert_eq!("../2025-01-01", render_lexical_interval(&iv));
+        let iv = legacy_interval_to_lexical(&legacy_dti("2025-01-01/.."));
+        assert_eq!("2025-01-01/..", render_lexical_interval(&iv));
+        let iv = legacy_interval_to_lexical(&legacy_dti("2025-01-01/"));
+        assert_eq!("2025-01-01/", render_lexical_interval(&iv));
+    }
+
+    #[test]
+    fn posix_to_leap_aware_secs_boundaries() {
+        // pre-1972: no leap seconds at all
+        assert_eq!(0, posix_to_leap_aware_secs(0));
+        // the 2016 leap day's own midnight: 26 prior leap days
+        assert_eq!(1_483_142_400 + 26, posix_to_leap_aware_secs(1_483_142_400));
+        // 2017-01-01 midnight: all 27
+        assert_eq!(1_483_228_800 + 27, posix_to_leap_aware_secs(1_483_228_800));
+    }
+
+    #[test]
+    fn upgrade_lexical_intervals_converts_fixed_width() {
+        let mut entries = vec![
+            legacy_entry("2025-01-01T10:00:00Z/2025-03-31T12:00:00Z"),
+            legacy_entry("2025-04-01T10:00:00Z/2025-06-30T12:00:00Z"),
+        ];
+        entries.sort();
+        let dict = build_dict(entries);
+        let dict = dict.upgrade_lexical_intervals();
+        // every segment entry now decodes as lexical
+        let seg = dict.lexical_interval_segment().unwrap();
+        for id in seg.clone() {
+            let e = dict.entry(id as usize).unwrap();
+            decode_lexical_entry(&e.to_bytes()).expect("upgraded entry decodes as lexical");
+        }
+        // probes and end index work on the upgraded dictionary
+        let s15 = posix_to_leap_aware_secs(1_737_417_600); // 2025-02-15 UTC
+        let r = dict.lexical_ids_start_le(1_737_417_600, 0);
+        assert_eq!(seg.start + 1, r.finite.end);
+        let _ = s15;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lexical_end_index_files_round_trip() {
+        use crate::bitindex::BitIndex;
+        use crate::storage::memory::MemoryBackedStore;
+        use crate::storage::types::FileLoad;
+        let dict = build_dict(vec![
+            iv_entry("2025-01-01T10:00:00Z/2025-03-31T12:00:00Z"),
+            iv_entry("2025-04-01T10:00:00Z/2025-06-30T12:00:00Z"),
+            iv_entry("2025-07-01T10:00:00Z/2025-09-30T12:00:00Z"),
+        ]);
+        let ends = MemoryBackedStore::new();
+        let bits = MemoryBackedStore::new();
+        let blocks = MemoryBackedStore::new();
+        let sblocks = MemoryBackedStore::new();
+        build_interval_end_index_lexical(
+            &dict,
+            ends.clone(),
+            bits.clone(),
+            blocks.clone(),
+            sblocks.clone(),
+        )
+        .await
+        .unwrap();
+        let idx = IntervalEndIndex::from_parts(
+            crate::logarray::LogArray::parse(ends.map().await.unwrap()).unwrap(),
+            BitIndex::from_maps(
+                bits.map().await.unwrap(),
+                blocks.map().await.unwrap(),
+                sblocks.map().await.unwrap(),
+            ),
+        );
+        assert_eq!(3, idx.num_distinct_ends());
+        // bound in the leap-aware domain: 2025-05-01 UTC
+        let bound = posix_to_leap_aware_secs(1_746_057_600);
+        assert_eq!(vec![0], idx.positions_end_le(0..3, bound, 0));
     }
 }

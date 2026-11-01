@@ -127,17 +127,6 @@ fn denom(len: usize) -> Integer {
     format!("1{}", "0".repeat(len)).parse::<Integer>().unwrap()
 }
 
-// Canonical fraction: trailing zeros carry no value ("500" == "5").
-// Required for bytewise keys — without it equal instants sort unequal.
-fn canon_frac(f: &str) -> Option<&str> {
-    let t = f.trim_end_matches('0');
-    if t.is_empty() {
-        None
-    } else {
-        Some(t)
-    }
-}
-
 fn make_rational(p: &Parts, frac: &str) -> Rational {
     let int = p.int.parse::<Integer>().unwrap();
     let d = denom(frac.len());
@@ -153,7 +142,10 @@ fn make_rational(p: &Parts, frac: &str) -> Rational {
 
 fn make_deckey(p: &Parts, frac: &str) -> Vec<u8> {
     let int = p.int.parse::<Integer>().unwrap();
-    integer_and_fraction_to_storage(p.is_neg, int, canon_frac(frac))
+    // verbatim digits: `.5` and `.50` are distinct literals that order
+    // adjacent — equal instants tie-break on spelling
+    let frac = if frac.is_empty() { None } else { Some(frac) };
+    integer_and_fraction_to_storage(p.is_neg, int, frac)
 }
 
 fn make_lean(int: &str, frac: &str) -> (i64, u32) {

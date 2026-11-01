@@ -220,9 +220,8 @@ impl WaveletTree {
     /// Two strategies: when the value window is narrower than the position
     /// window, each candidate value is looked up directly
     /// (O(width · log sigma + k log sigma), selective queries stay fast
-    /// regardless of n); otherwise the values present are discovered by a
-    /// decode pass over the sequence and each is looked up once
-    /// (O(n + sigma_range log sigma), better for broad ranges).
+    /// regardless of n); otherwise the position window is scanned with
+    /// `decode_one` (O(|pos| · width), no allocation).
     pub fn positions_in_range(&self, pos: Range<u64>, val_lo: u64, val_hi: u64) -> Vec<u64> {
         let pos_hi = pos.end.min(self.len() as u64);
         if self.num_layers == 0 || pos.start >= pos_hi || val_lo > val_hi {
@@ -238,15 +237,12 @@ impl WaveletTree {
                 }
             }
         } else {
-            let mut values: Vec<u64> = self
-                .decode()
-                .filter(|v| *v >= val_lo && *v <= val_hi)
-                .collect();
-            values.sort_unstable();
-            values.dedup();
-            for v in values {
-                if let Some(lookup) = self.lookup(v) {
-                    out.extend(lookup.iter().filter(|p| *p >= pos.start && *p < pos_hi));
+            // wide value window: scan the position window directly — each
+            // decode_one is O(width), and positions come out ascending.
+            for i in pos.start..pos_hi {
+                let v = self.decode_one(i as usize);
+                if v >= val_lo && v <= val_hi {
+                    out.push(i);
                 }
             }
         }

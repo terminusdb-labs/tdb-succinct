@@ -1504,9 +1504,10 @@ impl IntervalEndIndex {
 
 use super::block::SizedDictEntry;
 use super::datatypes::{
-    DateTimeInterval, FromLexical, INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_OPEN,
-    INTERVAL_COMPONENT_UNKNOWN, INTERVAL_ENCODED_WIDTH, INTERVAL_FLAG_DURATION_END,
-    INTERVAL_FLAG_START_DURATION, INTERVAL_LEGACY_ENCODED_WIDTH, INTERVAL_NO_ZONE,
+    DateTimeInterval, FromLexical, INTERVAL_COMPONENT_DATE, INTERVAL_COMPONENT_DATETIME,
+    INTERVAL_COMPONENT_OPEN, INTERVAL_COMPONENT_UNKNOWN, INTERVAL_ENCODED_WIDTH,
+    INTERVAL_FLAG_DURATION_END, INTERVAL_FLAG_START_DURATION, INTERVAL_LEGACY_ENCODED_WIDTH,
+    INTERVAL_NO_ZONE,
 };
 use super::typed::{TypedDictBufBuilder, TypedDictEntry};
 use crate::logarray::LogArrayFileBuilder;
@@ -1645,6 +1646,85 @@ pub fn legacy_interval_to_lexical(iv: &DateTimeInterval) -> LexicalInterval {
         flag: iv.flag,
         canonical,
     }
+}
+
+/// `TypedDictEntry` for a lexical interval — the constructor callers use
+/// instead of spelling out the SizedDictEntry plumbing.
+pub fn lexical_interval_entry(iv: &LexicalInterval) -> TypedDictEntry {
+    TypedDictEntry::new(
+        Datatype::DateTimeInterval,
+        SizedDictEntry::from(Bytes::from(encode_lexical_interval(iv))),
+    )
+}
+
+/// A `LexicalInterval` as a fixed-width `DateTimeInterval` — the inverse of
+/// `legacy_interval_to_lexical`, for bridges that still speak the legacy
+/// term shape (e.g. the store-prolog object renderer).
+///
+/// Returns `None` when the lexical form is unrepresentable in the fixed
+/// format: sub-nanosecond fractions or an out-of-i64 instant. Unspecified
+/// endpoints render as open — that is their comparison semantics — and a
+/// leap-second instant lands on the following second, matching the probe
+/// convention.
+pub fn lexical_interval_to_legacy(iv: &LexicalInterval) -> Option<DateTimeInterval> {
+    fn legacy_component_of(c: &Component) -> Option<(i64, u32, u8, i16)> {
+        match c {
+            Component::Unbounded | Component::Unspecified => {
+                Some((0, 0, INTERVAL_COMPONENT_OPEN, INTERVAL_NO_ZONE))
+            }
+            Component::Unknown => Some((0, 0, INTERVAL_COMPONENT_UNKNOWN, INTERVAL_NO_ZONE)),
+            Component::Finite(f) => {
+                if f.frac_len > 9 {
+                    return None;
+                }
+                let (secs, nanos, leap) = finite_posix_nanos(f);
+                let secs = if leap { secs.saturating_add(1) } else { secs };
+                let component_type = if f.kind == KIND_DATE {
+                    INTERVAL_COMPONENT_DATE
+                } else {
+                    INTERVAL_COMPONENT_DATETIME
+                };
+                let tz = match f.tz_class {
+                    TZ_ZONELESS => INTERVAL_NO_ZONE,
+                    TZ_Z => 0,
+                    _ => f.offset_minutes,
+                };
+                Some((secs, nanos, component_type, tz))
+            }
+        }
+    }
+    let (start_seconds, start_nanos, start_type, start_tz) = legacy_component_of(&iv.start)?;
+    let (end_seconds, end_nanos, end_type, end_tz) = legacy_component_of(&iv.end)?;
+
+    // The period string is the supplied canonical for duration forms, the
+    // derived period for explicit pairs.
+    let period = match iv.flag {
+        FLAG_START_DURATION => iv.canonical.split('/').nth(1).unwrap_or("PT0S").to_string(),
+        FLAG_DURATION_END => iv.canonical.split('/').next().unwrap_or("PT0S").to_string(),
+        _ => derived_period(iv),
+    };
+    let duration = parse_iso_duration(&period).unwrap_or(Duration {
+        sign: 0,
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0.0,
+    });
+
+    Some(DateTimeInterval {
+        start_seconds,
+        start_nanos,
+        end_seconds,
+        end_nanos,
+        start_type,
+        end_type,
+        flag: iv.flag,
+        duration,
+        start_tz,
+        end_tz,
+    })
 }
 
 impl TypedDict {
@@ -1912,6 +1992,102 @@ pub fn interval_relation(a: &LexicalInterval, rel: AllenRelation, b: &LexicalInt
         During => Bound::lt(&bs, &as_) && Bound::lt(&ae, &be),
         _ => unreachable!(),
     }
+}
+
+// -- relation probing ---------------------------------------------------------
+
+/// POSIX `(secs, nanos)` probe key for a finite component, plus whether the
+/// instant is a leap second. POSIX cannot spell `23:59:60`, so a leap-second
+/// bound has no exact probe key — callers must widen `le`/`lt` bounds by one
+/// second up, `ge`/`gt` one second down, and `eq` into the `[t-1, t+1]`
+/// window so the boundary instant is never excluded.
+pub fn finite_posix_nanos(f: &FiniteComponent) -> (i64, u32, bool) {
+    let (secs, nanos) = secs_nanos(f);
+    let (naive, leap) = leap_instant_to_naive(secs);
+    (naive.and_utc().timestamp(), nanos, leap)
+}
+
+/// Probe-facing bound class: the open extreme on that side, or `Null` for
+/// incommensurable specials (unknown, unspecified).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundClass {
+    Finite(i64, u32, bool),
+    Open,
+    Null,
+}
+
+/// Classify a start component for probing: `..` is the open lower extreme.
+pub fn start_bound_class(c: &Component) -> BoundClass {
+    match c {
+        Component::Finite(f) => {
+            let (s, n, l) = finite_posix_nanos(f);
+            BoundClass::Finite(s, n, l)
+        }
+        Component::Unbounded => BoundClass::Open,
+        _ => BoundClass::Null,
+    }
+}
+
+/// Classify an end component for probing: `..` is the open upper extreme.
+pub fn end_bound_class(c: &Component) -> BoundClass {
+    match c {
+        Component::Finite(f) => {
+            let (s, n, l) = finite_posix_nanos(f);
+            BoundClass::Finite(s, n, l)
+        }
+        Component::Unbounded => BoundClass::Open,
+        _ => BoundClass::Null,
+    }
+}
+
+/// Interval bounds of a typed literal for relation probing, matching the
+/// engine's `S = V, E = V` rule: an `xdd:dateTimeInterval` decomposes into
+/// its components; any other literal compares as the zero-duration point at
+/// its instant (dates resolve to midnight in their supplied zone).
+pub fn literal_relation_bounds(
+    lexical: &str,
+    datatype: super::datatypes::Datatype,
+) -> Result<LexicalInterval, LexicalIntervalError> {
+    match datatype {
+        super::datatypes::Datatype::DateTimeInterval => literal_as_interval(lexical),
+        super::datatypes::Datatype::Date => {
+            let (d, tz) = lexical.split_at(10.min(lexical.len()));
+            let point = format!("{d}T00:00:00{}", if tz.is_empty() { "Z" } else { tz });
+            literal_as_interval(&point)
+        }
+        _ => literal_as_interval(lexical),
+    }
+}
+
+/// Relation bounds of a stored typed dictionary entry: interval entries
+/// decode structurally; date and date-time entries render and coerce to the
+/// zero-duration point at their instant. Other datatypes have no interval
+/// reading and return `None`.
+pub fn entry_relation_bounds(
+    entry: &super::typed::TypedDictEntry,
+) -> Option<LexicalInterval> {
+    use super::datatypes::Datatype;
+    let lexical: String = match entry.datatype() {
+        Datatype::DateTimeInterval => {
+            let bytes = entry.to_bytes();
+            return match bytes.len() {
+                // FFI-built references and un-upgraded dictionaries carry the
+                // fixed-width layout — decode and convert rather than fail.
+                INTERVAL_LEGACY_ENCODED_WIDTH => Some(legacy_interval_to_lexical(
+                    &DateTimeInterval::from_legacy_lexical(bytes),
+                )),
+                INTERVAL_ENCODED_WIDTH => Some(legacy_interval_to_lexical(
+                    &DateTimeInterval::from_lexical(bytes),
+                )),
+                _ => decode_lexical_entry(&bytes).ok(),
+            };
+        }
+        Datatype::DateTime => entry.as_val::<chrono::NaiveDateTime, String>(),
+        Datatype::DateTimeStamp => entry.as_val::<super::datatypes::DateTimeStamp, String>(),
+        Datatype::Date => entry.as_val::<super::datatypes::Date, String>(),
+        _ => return None,
+    };
+    literal_relation_bounds(&lexical, entry.datatype()).ok()
 }
 
 #[cfg(test)]

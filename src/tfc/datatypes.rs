@@ -60,6 +60,7 @@ pub enum Datatype {
     HexBinary,
     AnySimpleType,
     DateTimeInterval,
+    SQName,
 }
 
 impl Datatype {
@@ -1492,6 +1493,7 @@ stringy_type!(Language);
 stringy_type!(AnyURI);
 stringy_type!(Notation);
 stringy_type!(QName);
+stringy_type!(SQName);
 stringy_type!(ID);
 stringy_type!(IDRef);
 stringy_type!(Entity);
@@ -2072,5 +2074,29 @@ mod tests {
         let bytes = iv.to_lexical();
         // 8(i64) + 4(u32) + 8(i64) + 4(u32) + 1 + 1 + 1 + duration(1+8+1+1+1+1+8 = 21) + 2(start_tz) + 2(end_tz) = 52
         assert_eq!(52, bytes.len());
+    }
+
+    #[test]
+    fn sqname_entry_round_trip() {
+        let entry = SQName::make_entry(&"{https://xbrl.org/2021}foo:bar");
+        assert_eq!(Datatype::SQName, entry.datatype());
+        assert_eq!(
+            "{https://xbrl.org/2021}foo:bar",
+            entry.as_val::<SQName, String>()
+        );
+    }
+
+    #[test]
+    fn sqname_lexical_preserves_arbitrary_local_bytes() {
+        // The store layer keeps lexicals verbatim; OIM §3.1 allows any
+        // non-whitespace (colons, braces included) after the first `}`.
+        for lexical in [
+            "{https://xbrl.org/2021}foo:bar:baz",
+            "{http://eg/ns}a}b:c",
+            "{u}l",
+        ] {
+            let entry = SQName::make_entry(&lexical);
+            assert_eq!(lexical, entry.as_val::<SQName, String>());
+        }
     }
 }

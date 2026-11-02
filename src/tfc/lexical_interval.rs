@@ -1240,6 +1240,21 @@ pub fn render_lexical_interval(iv: &LexicalInterval) -> String {
         return extend_component(&iv.canonical);
     }
     let (l, r) = iv.canonical.split_once('/').unwrap_or((&iv.canonical, ""));
+    if iv.flag == FLAG_EXPLICIT && iv.start == iv.end {
+        if let Component::Finite(f) = &iv.start {
+            // A zoneless [t,t) is the as-of point spelling — the entry cannot
+            // distinguish a supplied pair from a bare component, and the
+            // value is the same instant either way. A day-aligned instant is
+            // the bare date. Zoned points keep the pair spelling.
+            if f.tz_class == TZ_ZONELESS {
+                let side = extend_component(l);
+                return match side.strip_suffix("T00:00:00") {
+                    Some(date) => date.to_string(),
+                    None => side,
+                };
+            }
+        }
+    }
     let render_side = |side: &str, c: &Component| match c {
         Component::Finite(_) => extend_component(side),
         _ => c.canonical_str().to_string(),

@@ -536,9 +536,34 @@ pub fn parse_lexical_interval(s: &str) -> Result<LexicalInterval, LexicalInterva
     if s.is_empty() {
         return Err(IntervalParseError::Empty.into());
     }
-    let slash = s
-        .find('/')
-        .ok_or_else(|| IntervalParseError::MissingSeparator(s.to_string()))?;
+    let slash = match s.find('/') {
+        Some(i) => i,
+        None => {
+            // A bare finite component is an as-of instant: a date anchors at
+            // local day-start, a dateTime at itself. Encode the point [t,t)
+            // as a datetime pair so the inclusive-day rule for date ends
+            // does not stretch it into a whole day; the canonical spelling
+            // renders back as the single supplied form.
+            let f = match parse_component(s, false)? {
+                Component::Finite(f) => FiniteComponent {
+                    kind: KIND_DATETIME,
+                    canonical: canonicalise_component(s),
+                    ..f
+                },
+                _ => {
+                    return Err(
+                        IntervalParseError::MissingSeparator(s.to_string()).into()
+                    )
+                }
+            };
+            return Ok(LexicalInterval {
+                start: Component::Finite(f.clone()),
+                end: Component::Finite(f),
+                flag: FLAG_EXPLICIT,
+                canonical: canonicalise_component(s),
+            });
+        }
+    };
     let (left, right) = (&s[..slash], &s[slash + 1..]);
 
     let left_dur = left.starts_with('P') || left.starts_with("-P");
@@ -1210,6 +1235,10 @@ pub fn decode_lexical_entry(bytes: &[u8]) -> Result<LexicalInterval, LexicalInte
 /// canonical payload (finite components get their separators restored;
 /// everything else is verbatim).
 pub fn render_lexical_interval(iv: &LexicalInterval) -> String {
+    if !iv.canonical.contains('/') {
+        // Single-component spelling (bare date/dateTime as-of point).
+        return extend_component(&iv.canonical);
+    }
     let (l, r) = iv.canonical.split_once('/').unwrap_or((&iv.canonical, ""));
     let render_side = |side: &str, c: &Component| match c {
         Component::Finite(_) => extend_component(side),
@@ -3468,9 +3497,21 @@ mod tests {
         let p = literal_as_interval("2025-02-01T00:00:00Z").unwrap();
         assert!(interval_relation(&p, During, &a));
         assert!(interval_relation(&a, Contains, &p));
-        // a bare `date` literal coerces to the day interval [day, day+1), not a point
+        // a bare `date` literal coerces to the as-of point at local
+        // day-start — [t,t) — while the explicit pair `date/date` keeps the
+        // whole local day
         let day = literal_as_interval("2025-02-01").unwrap();
-        assert!(!Bound::eq(&Bound::start(&day.start), &Bound::end(&day.end)));
+        assert!(Bound::eq(&Bound::start(&day.start), &Bound::end(&day.end)));
+        assert!(interval_relation(&day, During, &a));
+        assert!(interval_relation(&a, Contains, &day));
+        let day_interval = parse_lexical_interval("2025-02-01/2025-02-01").unwrap();
+        assert!(!Bound::eq(
+            &Bound::start(&day_interval.start),
+            &Bound::end(&day_interval.end)
+        ));
+        // the single-date point renders back as the supplied single date
+        assert_eq!(render_lexical_interval(&day), "2025-02-01");
+        assert_eq!(render_lexical_interval(&day_interval), "2025-02-01/2025-02-01");
         // the point sorting: i1, t, i2 — a point at a meeting boundary belongs
         // to the interval it starts
         let s = literal_as_interval("2025-01-01T00:00:00Z").unwrap();
